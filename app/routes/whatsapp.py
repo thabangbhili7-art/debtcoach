@@ -70,6 +70,26 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     step = get_step(phone)
     scratch = get_scratch(phone)
 
+   #THIS BLOCK RIGHT HERE (before PAID/DEBTS/RESET/SUMMARY) overvides
+    greet = text.strip().lower()
+    if greet in {"hi", "hello", "hey", "hie"}:
+        set_step(phone, "consent")
+        update_scratch(
+            phone,
+            creditors=[],
+            balance_index=None,
+            budget=None,
+            total=None,
+            months=None,
+        )
+        reply = (
+            "Hi! I’m DebtCoach. I help you organise debts.\n"
+            "Do you consent to me processing your debt info to create a plan and send reminders?\n"
+            "Reply YES or NO."
+        )
+        return make_response(reply, is_twilio)
+
+
     # 🔹 Global PAID command: log a payment and reduce debts
     if text.upper().startswith("PAID"):
         amount = parse_amount(text)
