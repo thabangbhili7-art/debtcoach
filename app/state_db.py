@@ -1,32 +1,45 @@
 # app/state_db.py
-from sqlalchemy.orm import Session
-from typing import Dict, Any, Tuple
-from .routes.models import User, ConvoState
+from __future__ import annotations
 
-def upsert_user(db: Session, phone: str) -> User:
-    user = db.query(User).filter(User.phone_e164 == phone).one_or_none()
-    if not user:
-        user = User(phone_e164=phone)
-        db.add(user)
-        db.flush()  # get user.id
-        # init convo state
-        cs = ConvoState(user_id=user.id, step="start", scratch={})
+from typing import Any, Dict
+from sqlalchemy.orm import Session
+
+from .models import ConvoState
+
+
+def _get_or_create_convo(db: Session, user_id: int) -> ConvoState:
+    cs = db.query(ConvoState).filter(ConvoState.user_id == user_id).one_or_none()
+    if cs is None:
+        cs = ConvoState(user_id=user_id, step="start", scratch={})
         db.add(cs)
         db.commit()
-    return user
+        db.refresh(cs)
+    return cs
 
-def get_state(db: Session, user_id: int) -> Tuple[str, Dict[str, Any]]:
-    cs = db.query(ConvoState).filter(ConvoState.user_id == user_id).one()
-    return cs.step, dict(cs.scratch or {})
 
-def set_step(db: Session, user_id: int, step: str):
-    db.query(ConvoState).filter(ConvoState.user_id == user_id).update({"step": step})
+def get_step(db: Session, user_id: int) -> str:
+    cs = _get_or_create_convo(db, user_id)
+    return cs.step or "start"
+
+
+def set_step(db: Session, user_id: int, step: str) -> None:
+    cs = _get_or_create_convo(db, user_id)
+    cs.step = step
+    db.add(cs)
     db.commit()
 
-def update_scratch(db: Session, user_id: int, **kwargs):
-    cs = db.query(ConvoState).filter(ConvoState.user_id == user_id).one()
+
+def get_scratch(db: Session, user_id: int) -> Dict[str, Any]:
+    cs = _get_or_create_convo(db, user_id)
+    return dict(cs.scratch or {})
+
+
+def update_scratch(db: Session, user_id: int, **kwargs) -> Dict[str, Any]:
+    cs = _get_or_create_convo(db, user_id)
     scratch = dict(cs.scratch or {})
     scratch.update(kwargs)
     cs.scratch = scratch
     db.add(cs)
     db.commit()
+    return scratch
+
