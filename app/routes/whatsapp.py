@@ -3,414 +3,249 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 from sqlalchemy.orm import Session
 import re
 from html import escape
+from twilio.rest import Client
+import os
 
 from ..db import get_db
 from ..state_db import get_step, set_step, get_scratch, update_scratch
-from ..models import User, Debt, Payment
+from ..models import User, Debt
 
 router = APIRouter()
 
+# -------------------------
+# TWILIO CONFIG
+# -------------------------
+twilio_client = Client(
+    os.getenv("TWILIO_ACCOUNT_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
+
+TWILIO_WHATSAPP_NUMBER = "whatsapp:+12312725816"
+
+# -------------------------
+# HELPERS
+# -------------------------
 AMOUNT_RE = re.compile(r"(?i)\b(?:r\s*)?(\d[\d\s,\.]*)\b")
 
-def parse_amount(text: str) -> int | None:
-    s = (text or "").replace("\u00A0", " ").strip()
-    m = AMOUNT_RE.search(s)
+def parse_amount(text: str):
+    m = AMOUNT_RE.search(text or "")
     if not m:
         return None
     raw = m.group(1).replace(" ", "").replace(",", "")
     try:
-        return int(round(float(raw)))
-    except Exception:
+        return int(float(raw))
+    except:
         return None
 
-def make_response(reply: str, is_twilio: bool):
-    """
-    Twilio WhatsApp expects TwiML XML.
-    Local curl/dev can use JSON.
-    """
-    if is_twilio:
-        xml = (
-            '<?xml version="1.0" encoding="UTF-8"?>'
-            f"<Response><Message>{escape(reply)}</Message></Response>"
-        )
-        return PlainTextResponse(content=xml, media_type="application/xml")
-    return JSONResponse({"reply": reply})
+
+def make_response(reply: str):
+    xml = f'<?xml version="1.0"?><Response><Message>{escape(reply)}</Message></Response>'
+    return PlainTextResponse(content=xml, media_type="application/xml")
 
 
+def send_whatsapp(to, message):
+    twilio_client.messages.create(
+        from_=TWILIO_WHATSAPP_NUMBER,
+        to=f"whatsapp:{to}",
+        body=message
+    )
+
+
+# -------------------------
+# MAIN WEBHOOK
+# -------------------------
 @router.post("/webhooks/whatsapp")
 async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-    # 1) Parse incoming payload (Twilio sends form-encoded; curl sends JSON)
-    try:
-        data = await request.json()
-    except Exception:
-        form = await request.form()
-        data = dict(form)
 
-    text = str(data.get("text") or data.get("Body") or data.get("message") or "").strip()
+    data = await request.form()
 
-    raw_from = data.get("from") or data.get("From") or "unknown"
-    phone = str(raw_from).strip()
+    text = str(data.get("Body") or "").strip()
+    phone = str(data.get("From") or "").replace("whatsapp:", "").strip()
 
-    # Detect Twilio WhatsApp: From is usually like "whatsapp:+27..."
-    is_twilio = ("Body" in data) or ("From" in data and str(data["From"]).startswith("whatsapp:"))
-
-    # Normalize phone for DB (store without whatsapp: prefix)
-    if phone.startswith("whatsapp:"):
-        phone = phone.replace("whatsapp:", "").strip()
-
-    # 2) Ensure user exists
+    # -------------------------
+    # USER
+    # -------------------------
     db_user = db.query(User).filter(User.phone_e164 == phone).one_or_none()
+
     if not db_user:
         db_user = User(phone_e164=phone)
         db.add(db_user)
         db.commit()
         db.refresh(db_user)
 
-    # 3) Load persistent conversation state
     step = get_step(db, db_user.id)
     scratch = get_scratch(db, db_user.id)
 
     # -------------------------
-    # GLOBAL: greetings reset
+    # GREETING
     # -------------------------
-    greet = text.strip().lower()
-    if greet in {"hi", "hello", "hey", "hie", "start"}:
+    if text.lower() in {"hi", "hello", "start"}:
         set_step(db, db_user.id, "consent")
-        update_scratch(
-            db,
-            db_user.id,
-            creditors=[],
-            balance_index=None,
-            budget=None,
-            total=None,
-            months=None,
-        )
-        reply = (
-            "Hi! I’m DebtCoach. I help you organise debts.\n"
-            "Do you consent to me processing your debt info to create a plan and send reminders?\n"
-            "Reply YES or NO."
-        )
-        return make_response(reply, is_twilio)
 
-    # -------------------------
-    # GLOBAL: PAID <amount>
-    # -------------------------
-    if text.upper().startswith("PAID"):
-        amount = parse_amount(text)
-        if amount is None:
-            return make_response(
-                "Please tell me how much you paid, e.g. 'PAID 500' or 'PAID R 750'.",
-                is_twilio,
-            )
-
-        pay_cents = amount * 100
-
-        debts = (
-            db.query(Debt)
-              .filter(Debt.user_id == db_user.id, Debt.balance_cents > 0)
-              .order_by(Debt.id.asc())
-              .all()
-        )
-        if not debts:
-            return make_response(
-                "I don't have any open debts for you. Send DEBTS to see what I have on file.",
-                is_twilio,
-            )
-
-        remaining = pay_cents
-        for d in debts:
-            if remaining <= 0:
-                break
-            if d.balance_cents <= remaining:
-                remaining -= d.balance_cents
-                d.balance_cents = 0
-            else:
-                d.balance_cents -= remaining
-                remaining = 0
-            db.add(d)
-
-        payment = Payment(user_id=db_user.id, amount_cents=pay_cents)
-        db.add(payment)
-        db.commit()
-
-        updated_debts = (
-            db.query(Debt)
-              .filter(Debt.user_id == db_user.id)
-              .order_by(Debt.id.asc())
-              .all()
+        return make_response(
+            "Hi! I’m DebtCoach AI for businesses.\n"
+            "I help you track customers who owe you and send reminders.\n\n"
+            "Reply YES to continue."
         )
 
-        total_cents = sum(d.balance_cents for d in updated_debts)
-
-        # update scratch months/total based on remaining + budget if we have one
-        budget = get_scratch(db, db_user.id).get("budget")
-        remaining_total_rands = total_cents // 100
-        if budget:
-            new_months = max(1, round(remaining_total_rands / budget))
-            update_scratch(db, db_user.id, total=remaining_total_rands, months=new_months)
-
-        lines = []
-        for d in updated_debts:
-            rands = d.balance_cents // 100
-            cents = d.balance_cents % 100
-            amount_str = f"R{rands}.{cents:02d}" if cents else f"R{rands}"
-            lines.append(f"• {d.creditor_name} – {amount_str}")
-
-        reply = (
-            f"Nice! I logged your payment of R{amount}.\n"
-            f"Your updated debts are:\n" + "\n".join(lines) +
-            f"\nTotal remaining: R{total_cents // 100}"
-        )
-        return make_response(reply, is_twilio)
-
     # -------------------------
-    # GLOBAL: DEBTS
-    # -------------------------
-    if text.upper() == "DEBTS":
-        debts = (
-            db.query(Debt)
-              .filter(Debt.user_id == db_user.id)
-              .order_by(Debt.id.asc())
-              .all()
-        )
-        if not debts:
-            return make_response(
-                "I don't have any debts saved for you yet. Say HI to start.",
-                is_twilio,
-            )
-
-        lines = []
-        for d in debts:
-            rands = d.balance_cents // 100
-            cents = d.balance_cents % 100
-            amount_str = f"R{rands}.{cents:02d}" if cents else f"R{rands}"
-            lines.append(f"• {d.creditor_name} – {amount_str}")
-
-        return make_response("Here’s what I have for you:\n" + "\n".join(lines), is_twilio)
-
-    # -------------------------
-    # GLOBAL: RESET
-    # -------------------------
-    if text.upper() == "RESET":
-        db.query(Debt).filter(Debt.user_id == db_user.id).delete()
-        db.query(Payment).filter(Payment.user_id == db_user.id).delete()
-        db.commit()
-
-        update_scratch(
-            db,
-            db_user.id,
-            creditors=[],
-            balance_index=None,
-            budget=None,
-            total=None,
-            months=None,
-        )
-        set_step(db, db_user.id, "start")
-
-        return make_response("All your debt data was cleared. Say HI to start again.", is_twilio)
-
-    # -------------------------
-    # GLOBAL: SUMMARY
-    # -------------------------
-    if text.upper() == "SUMMARY":
-        debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
-        if not debts:
-            return make_response(
-                "I don’t have any debts saved for you yet. Say HI to start or send DEBTS to see details.",
-                is_twilio,
-            )
-
-        total_cents = sum(d.balance_cents for d in debts)
-        total_rands = total_cents // 100
-        num_debts = len(debts)
-
-        scratch = get_scratch(db, db_user.id)
-        budget = scratch.get("budget")
-
-        if budget:
-            est_months = max(1, round(total_rands / budget))
-            reply = (
-                f"You currently owe R{total_rands} across {num_debts} debts.\n"
-                f"With your current plan of R{budget}/month, you can be debt-free in ~{est_months} months.\n"
-                "Send DEBTS for a detailed breakdown."
-            )
-        else:
-            reply = (
-                f"You currently owe R{total_rands} across {num_debts} debts.\n"
-                "We don’t have a monthly plan yet. Say HI and go through the intake to set one up."
-            )
-
-        return make_response(reply, is_twilio)
-
-    # -------------------------
-    # FLOW: start -> consent
-    # -------------------------
-    if step == "start":
-        set_step(db, db_user.id, "consent")
-        reply = (
-            "Hi! I’m DebtCoach. I help you organise debts.\n"
-            "Do you consent to me processing your debt info to create a plan and send reminders?\n"
-            "Reply YES or NO."
-        )
-        return make_response(reply, is_twilio)
-
-    # -------------------------
-    # FLOW: consent
+    # CONSENT
     # -------------------------
     if step == "consent":
-        msg = text.lower()
-        if msg in {"yes", "y", "yeah", "yebo", "ewe", "ee", "sure", "ok"}:
-            set_step(db, db_user.id, "intake_creditor")
-            update_scratch(db, db_user.id, creditors=[], balance_index=None)
+        if text.lower() == "yes":
+            set_step(db, db_user.id, "business_ready")
+
             return make_response(
-                "Great! Who do you owe first? (Type one creditor at a time, or type DONE to finish)",
-                is_twilio,
-            )
-        if msg in {"no", "n", "nope", "cha", "hayi", "aowa"}:
-            set_step(db, db_user.id, "start")
-            return make_response("No problem. If you change your mind, just say HI.", is_twilio)
-
-        return make_response("Please reply YES to proceed, or NO to stop.", is_twilio)
-
-    # -------------------------
-    # FLOW: intake_creditor
-    # -------------------------
-    if step == "intake_creditor":
-        if text.lower() == "done":
-            creditors = scratch.get("creditors", [])
-            if not creditors:
-                return make_response("Add at least one creditor name, then type DONE.", is_twilio)
-
-            update_scratch(db, db_user.id, balance_index=0)
-            set_step(db, db_user.id, "intake_balance")
-
-            first_name = creditors[0]["name"]
-            return make_response(
-                f"Nice. What is the current balance for {first_name}? (e.g. 1200 or R 1,200)",
-                is_twilio,
+                "You're set.\n\n"
+                "Commands:\n"
+                "ADD\n"
+                "LIST\n"
+                "SUMMARY\n"
+                "REMIND <name>\n"
+                "REMIND John, Tshepo\n"
+                "REMIND ALL"
             )
 
-        creditors = scratch.get("creditors", [])
-        if len(creditors) >= 20:
-            return make_response(
-                "Let’s keep it manageable. You’ve added 20 creditors already.\n"
-                "Type DONE if you’re finished, or RESET to start over.",
-                is_twilio,
-            )
-
-        creditors.append({"name": text, "balance": None})
-        update_scratch(db, db_user.id, creditors=creditors)
-
-        return make_response(f"Added {text}. You can add another creditor, or type DONE.", is_twilio)
+        return make_response("Reply YES to continue.")
 
     # -------------------------
-    # FLOW: intake_balance
+    # MAIN MODE
     # -------------------------
-    if step == "intake_balance":
-        amt = parse_amount(text)
-        if amt is None:
-            return make_response("Please send the balance as a number (e.g. 1200 or R 1,200).", is_twilio)
+    if step == "business_ready":
 
-        if amt <= 0:
-            return make_response("The balance must be more than zero. Please send a valid amount.", is_twilio)
+        # ADD
+        if text.upper() == "ADD":
+            set_step(db, db_user.id, "add_name")
+            return make_response("Send customer name.")
 
-        if amt > 1_000_000:
-            return make_response(
-                "That amount seems very high. If it’s correct, please split this creditor into separate accounts or confirm with a counsellor.",
-                is_twilio,
-            )
+        # LIST
+        if text.upper() in {"LIST", "DEBTS"}:
+            debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
-        creditors = scratch.get("creditors", [])
-        idx = scratch.get("balance_index", 0)
+            if not debts:
+                return make_response("No customers yet.")
 
-        if not creditors:
-            # should not happen, but recover gracefully
-            set_step(db, db_user.id, "intake_creditor")
-            update_scratch(db, db_user.id, creditors=[], balance_index=None)
-            return make_response("Let’s restart. Who do you owe first?", is_twilio)
+            lines = []
+            for d in debts:
+                amt = d.balance_cents // 100
+                lines.append(f"• {d.creditor_name} – R{amt} ({d.phone_number})")
 
-        if idx < 0 or idx >= len(creditors):
-            update_scratch(db, db_user.id, balance_index=0)
-            first_name = creditors[0]["name"]
-            return make_response(f"Let’s try again. What is the balance for {first_name}?", is_twilio)
+            return make_response("\n".join(lines))
 
-        creditors[idx]["balance"] = amt
-        update_scratch(db, db_user.id, creditors=creditors)
+        # SUMMARY
+        if text.upper() == "SUMMARY":
+            debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
-        if idx + 1 < len(creditors):
-            next_idx = idx + 1
-            next_name = creditors[next_idx]["name"]
-            update_scratch(db, db_user.id, balance_index=next_idx)
-            return make_response(f"Got it. Now what is the balance for {next_name}?", is_twilio)
+            if not debts:
+                return make_response("No data yet.")
 
-        # finished balances -> budget
-        update_scratch(db, db_user.id, balance_index=None)
-        set_step(db, db_user.id, "budget")
-        return make_response(
-            "Thanks. How much can you pay each month across all debts? (numbers only, e.g. 1500)",
-            is_twilio,
+            total = sum(d.balance_cents for d in debts) // 100
+
+            return make_response(f"Customers owe you R{total}.")
+
+        # -------------------------
+        # REMIND LOGIC (FULL FLEX)
+        # -------------------------
+        if text.upper().startswith("REMIND"):
+
+            command = text[6:].strip()
+
+            debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
+
+            if not debts:
+                return make_response("No customers to remind.")
+
+            # GUIDE USER
+            if not command:
+                return make_response(
+                    "Use:\nREMIND John\nREMIND John, Tshepo\nREMIND ALL"
+                )
+
+            # REMIND ALL
+            if command.upper() == "ALL":
+                sent = 0
+
+                for d in debts:
+                    if d.phone_number and d.balance_cents > 0:
+                        send_whatsapp(
+                            d.phone_number,
+                            f"Hi {d.creditor_name}, reminder you owe R{d.balance_cents // 100}."
+                        )
+                        sent += 1
+
+                return make_response(f"Sent reminders to {sent} customers.")
+
+            # REMIND MULTIPLE
+            names = [n.strip().lower() for n in command.split(",")]
+
+            sent = []
+            not_found = []
+
+            for name in names:
+                match = None
+
+                for d in debts:
+                    if name in d.creditor_name.lower():
+                        match = d
+                        break
+
+                if match and match.phone_number:
+                    send_whatsapp(
+                        match.phone_number,
+                        f"Hi {match.creditor_name}, reminder you owe R{match.balance_cents // 100}."
+                    )
+                    sent.append(match.creditor_name)
+                else:
+                    not_found.append(name)
+
+            reply = ""
+
+            if sent:
+                reply += f"Sent to: {', '.join(sent)}.\n"
+
+            if not_found:
+                reply += f"Not found: {', '.join(not_found)}."
+
+            return make_response(reply.strip())
+
+    # -------------------------
+    # ADD FLOW
+    # -------------------------
+    if step == "add_name":
+        update_scratch(db, db_user.id, name=text)
+        set_step(db, db_user.id, "add_phone")
+        return make_response("Send phone number (e.g. +27712345678).")
+
+    if step == "add_phone":
+        update_scratch(db, db_user.id, phone=text)
+        set_step(db, db_user.id, "add_amount")
+        return make_response("Send amount owed.")
+
+    if step == "add_amount":
+        amount = parse_amount(text)
+
+        if amount is None or amount <= 0:
+            return make_response("Send a valid amount.")
+
+        name = scratch.get("name")
+        phone_num = scratch.get("phone")
+
+        db_debt = Debt(
+            user_id=db_user.id,
+            creditor_name=name,
+            phone_number=phone_num,
+            balance_cents=amount * 100,
         )
-
-    # -------------------------
-    # FLOW: budget
-    # -------------------------
-    if step == "budget":
-        budget = parse_amount(text)
-        if budget is None:
-            return make_response("Please send the monthly amount as a number (e.g. 1500).", is_twilio)
-
-        if budget < 100:
-            return make_response(
-                "An amount under R100/month is very low. Please send a realistic monthly amount you can commit.",
-                is_twilio,
-            )
-        if budget > 100_000:
-            return make_response("That monthly amount seems very high. Please double-check and send again.", is_twilio)
-
-        creditors = scratch.get("creditors", [])
-        total = sum(c.get("balance") or 0 for c in creditors)
-        months = max(1, round(total / budget)) if budget else 1
-
-        # Optional: clear old debts before re-saving intake (prevents duplicates)
-        # If you want to keep old debts, comment these two lines out.
-        db.query(Debt).filter(Debt.user_id == db_user.id).delete()
+        db.add(db_debt)
         db.commit()
 
-        for c in creditors:
-            db_debt = Debt(
-                user_id=db_user.id,
-                creditor_name=c["name"],
-                balance_cents=(c.get("balance") or 0) * 100,
-            )
-            db.add(db_debt)
-        db.commit()
-
-        update_scratch(db, db_user.id, budget=budget, total=total, months=months)
-        set_step(db, db_user.id, "plan_ready")
+        set_step(db, db_user.id, "business_ready")
 
         return make_response(
-            f"If you pay R{budget} per month, you can be debt-free in ~{months} months.\n"
-            "Type START to restart, or PAID <amount> after you make a payment.",
-            is_twilio,
+            f"Added {name} – owes you R{amount}.\nReply ADD to add another."
         )
 
-    # -------------------------
-    # FLOW: plan_ready
-    # -------------------------
-    if step == "plan_ready":
-        if text.lower() == "start":
-            set_step(db, db_user.id, "intake_creditor")
-            update_scratch(db, db_user.id, creditors=[], balance_index=None)
-            return make_response(
-                "Ok, add creditors again. Type one at a time, or DONE when finished.",
-                is_twilio,
-            )
-
-        return make_response("All set. Say START to restart, or send DEBTS / PAID <amount> anytime.", is_twilio)
-
-    # fallback
-    set_step(db, db_user.id, "start")
-    return make_response("Let’s begin. Say HI.", is_twilio)
+    return make_response("Say HI to start.")
 
 
 
