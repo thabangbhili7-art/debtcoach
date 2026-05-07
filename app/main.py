@@ -7,7 +7,6 @@ app = FastAPI()
 app.include_router(whatsapp_router)
 app.include_router(dashboard_router)
 
-
 @app.get("/health")
 def health():
     return {"ok": True}
