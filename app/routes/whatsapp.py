@@ -1,5 +1,5 @@
 from fastapi import APIRouter, Request, Depends
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 import re
 from html import escape
@@ -17,7 +17,7 @@ router = APIRouter()
 # -------------------------
 twilio_client = Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
-    os.getenv("TWILIO_AUTH_TOKEN")
+    os.getenv("TWILIO_AUTH_TOKEN"),
 )
 
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+12312725816"
@@ -27,28 +27,58 @@ TWILIO_WHATSAPP_NUMBER = "whatsapp:+12312725816"
 # -------------------------
 AMOUNT_RE = re.compile(r"(?i)\b(?:r\s*)?(\d[\d\s,\.]*)\b")
 
+
 def parse_amount(text: str):
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
+
     raw = m.group(1).replace(" ", "").replace(",", "")
+
     try:
         return int(float(raw))
-    except:
+    except Exception:
         return None
 
 
 def make_response(reply: str):
-    xml = f'<?xml version="1.0"?><Response><Message>{escape(reply)}</Message></Response>'
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        f"<Response><Message>{escape(reply)}</Message></Response>"
+    )
     return PlainTextResponse(content=xml, media_type="application/xml")
 
 
-def send_whatsapp(to, message):
-    twilio_client.messages.create(
-        from_=TWILIO_WHATSAPP_NUMBER,
-        to=f"whatsapp:{to}",
-        body=message
+def normalize_phone(phone: str):
+    phone = (phone or "").strip().replace(" ", "")
+
+    if phone.startswith("0"):
+        phone = "+27" + phone[1:]
+
+    return phone
+
+
+def reminder_message(customer_name: str, amount_rands: int):
+    return (
+        f"Hi {customer_name}, this is a friendly reminder that you have "
+        f"an outstanding balance of R{amount_rands}. "
+        "Please let us know once payment is made."
     )
+
+
+def send_whatsapp(to: str, message: str):
+    to = normalize_phone(to)
+
+    try:
+        twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=f"whatsapp:{to}",
+            body=message,
+        )
+        return True, None
+    except Exception as e:
+        print("TWILIO SEND ERROR:", str(e))
+        return False, str(e)
 
 
 # -------------------------
@@ -56,7 +86,6 @@ def send_whatsapp(to, message):
 # -------------------------
 @router.post("/webhooks/whatsapp")
 async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
-
     data = await request.form()
 
     text = str(data.get("Body") or "").strip()
@@ -79,7 +108,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     # -------------------------
     # GREETING
     # -------------------------
-    if text.lower() in {"hi", "hello", "start"}:
+    if text.lower() in {"hi", "hello", "hey", "start"}:
         set_step(db, db_user.id, "consent")
 
         return make_response(
@@ -92,7 +121,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     # CONSENT
     # -------------------------
     if step == "consent":
-        if text.lower() == "yes":
+        if text.lower() in {"yes", "y"}:
             set_step(db, db_user.id, "business_ready")
 
             return make_response(
@@ -112,42 +141,57 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     # MAIN MODE
     # -------------------------
     if step == "business_ready":
+        upper_text = text.upper()
 
         # ADD
-        if text.upper() == "ADD":
+        if upper_text == "ADD":
             set_step(db, db_user.id, "add_name")
             return make_response("Send customer name.")
 
         # LIST
-        if text.upper() in {"LIST", "DEBTS"}:
+        if upper_text in {"LIST", "DEBTS"}:
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
             if not debts:
                 return make_response("No customers yet.")
 
             lines = []
+            total = 0
+
             for d in debts:
                 amt = d.balance_cents // 100
-                lines.append(f"• {d.creditor_name} – R{amt} ({d.phone_number})")
+                total += amt
+                phone_display = d.phone_number or "No phone"
+                lines.append(f"• {d.creditor_name} – R{amt} ({phone_display})")
 
+            lines.append(f"\nTotal owed: R{total}")
             return make_response("\n".join(lines))
 
         # SUMMARY
-        if text.upper() == "SUMMARY":
+        if upper_text == "SUMMARY":
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
             if not debts:
                 return make_response("No data yet.")
 
             total = sum(d.balance_cents for d in debts) // 100
+            count = len(debts)
 
-            return make_response(f"Customers owe you R{total}.")
+            return make_response(
+                f"Customers owe you R{total} across {count} account(s)."
+            )
+
+        # RESET
+        if upper_text == "RESET":
+            db.query(Debt).filter(Debt.user_id == db_user.id).delete()
+            db.commit()
+            set_step(db, db_user.id, "business_ready")
+            return make_response("All customer data cleared.")
 
         # -------------------------
-        # REMIND LOGIC (FULL FLEX)
+        # REMIND LOGIC
         # -------------------------
-        if text.upper().startswith("REMIND"):
-
+        if upper_text.startswith("REMIND"):
             command = text[6:].strip()
 
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
@@ -155,7 +199,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             if not debts:
                 return make_response("No customers to remind.")
 
-            # GUIDE USER
             if not command:
                 return make_response(
                     "Use:\nREMIND John\nREMIND John, Tshepo\nREMIND ALL"
@@ -163,50 +206,91 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
 
             # REMIND ALL
             if command.upper() == "ALL":
-                sent = 0
+                sent = []
+                failed = []
+                skipped = []
 
                 for d in debts:
-                    if d.phone_number and d.balance_cents > 0:
-                        send_whatsapp(
-                            d.phone_number,
-                            f"Hi {d.creditor_name}, reminder you owe R{d.balance_cents // 100}."
-                        )
-                        sent += 1
+                    if d.balance_cents <= 0:
+                        skipped.append(d.creditor_name)
+                        continue
 
-                return make_response(f"Sent reminders to {sent} customers.")
+                    if not d.phone_number:
+                        failed.append(f"{d.creditor_name} (no phone)")
+                        continue
 
-            # REMIND MULTIPLE
-            names = [n.strip().lower() for n in command.split(",")]
+                    amount = d.balance_cents // 100
+                    ok, error = send_whatsapp(
+                        d.phone_number,
+                        reminder_message(d.creditor_name, amount),
+                    )
+
+                    if ok:
+                        sent.append(d.creditor_name)
+                    else:
+                        failed.append(d.creditor_name)
+
+                reply_parts = []
+
+                if sent:
+                    reply_parts.append(f"Sent to: {', '.join(sent)}.")
+                if failed:
+                    reply_parts.append(f"Failed/skipped: {', '.join(failed)}.")
+                if not sent and not failed:
+                    reply_parts.append("No reminders sent.")
+
+                return make_response("\n".join(reply_parts))
+
+            # REMIND ONE OR MULTIPLE
+            requested_names = [n.strip().lower() for n in command.split(",") if n.strip()]
 
             sent = []
             not_found = []
+            failed = []
 
-            for name in names:
+            for name in requested_names:
                 match = None
 
                 for d in debts:
-                    if name in d.creditor_name.lower():
+                    if name in (d.creditor_name or "").lower():
                         match = d
                         break
 
-                if match and match.phone_number:
-                    send_whatsapp(
-                        match.phone_number,
-                        f"Hi {match.creditor_name}, reminder you owe R{match.balance_cents // 100}."
-                    )
+                if not match:
+                    not_found.append(name)
+                    continue
+
+                if not match.phone_number:
+                    failed.append(f"{match.creditor_name} (no phone)")
+                    continue
+
+                amount = match.balance_cents // 100
+                ok, error = send_whatsapp(
+                    match.phone_number,
+                    reminder_message(match.creditor_name, amount),
+                )
+
+                if ok:
                     sent.append(match.creditor_name)
                 else:
-                    not_found.append(name)
+                    failed.append(match.creditor_name)
 
-            reply = ""
+            reply_parts = []
 
             if sent:
-                reply += f"Sent to: {', '.join(sent)}.\n"
-
+                reply_parts.append(f"Sent to: {', '.join(sent)}.")
+            if failed:
+                reply_parts.append(f"Failed: {', '.join(failed)}.")
             if not_found:
-                reply += f"Not found: {', '.join(not_found)}."
+                reply_parts.append(f"Not found: {', '.join(not_found)}.")
 
-            return make_response(reply.strip())
+            return make_response(
+                "\n".join(reply_parts) if reply_parts else "No reminders sent."
+            )
+
+        return make_response(
+            "Commands:\nADD\nLIST\nSUMMARY\nREMIND <name>\nREMIND John, Tshepo\nREMIND ALL"
+        )
 
     # -------------------------
     # ADD FLOW
@@ -217,7 +301,8 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
         return make_response("Send phone number (e.g. +27712345678).")
 
     if step == "add_phone":
-        update_scratch(db, db_user.id, phone=text)
+        clean_phone = normalize_phone(text)
+        update_scratch(db, db_user.id, phone=clean_phone)
         set_step(db, db_user.id, "add_amount")
         return make_response("Send amount owed.")
 
@@ -227,6 +312,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
         if amount is None or amount <= 0:
             return make_response("Send a valid amount.")
 
+        scratch = get_scratch(db, db_user.id)
         name = scratch.get("name")
         phone_num = scratch.get("phone")
 
@@ -236,9 +322,11 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             phone_number=phone_num,
             balance_cents=amount * 100,
         )
+
         db.add(db_debt)
         db.commit()
 
+        update_scratch(db, db_user.id, name=None, phone=None)
         set_step(db, db_user.id, "business_ready")
 
         return make_response(
