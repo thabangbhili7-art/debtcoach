@@ -1,16 +1,13 @@
 from fastapi import FastAPI
 from .routes.whatsapp import router as whatsapp_router
-from .db import Base, engine
-from . import models 
+from .routes.dashboard import router as dashboard_router
 
-app = FastAPI(title="DebtCoach API", version="0.0.2")
+app = FastAPI()
 
-@app.on_event("startup")
-def on_startup():
-    Base.metadata.create_all(bind=engine)
+app.include_router(whatsapp_router)
+app.include_router(dashboard_router)
+
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
-
-app.include_router(whatsapp_router)
+    return {"ok": True}
