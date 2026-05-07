@@ -12,19 +12,14 @@ from ..models import User, Debt
 
 router = APIRouter()
 
-# -------------------------
-# TWILIO CONFIG
-# -------------------------
 twilio_client = Client(
     os.getenv("TWILIO_ACCOUNT_SID"),
     os.getenv("TWILIO_AUTH_TOKEN"),
 )
 
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+12312725816"
+PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://debtcoach.online/pay")
 
-# -------------------------
-# HELPERS
-# -------------------------
 AMOUNT_RE = re.compile(r"(?i)\b(?:r\s*)?(\d[\d\s,\.]*)\b")
 
 
@@ -32,9 +27,7 @@ def parse_amount(text: str):
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
-
     raw = m.group(1).replace(" ", "").replace(",", "")
-
     try:
         return int(float(raw))
     except Exception:
@@ -51,10 +44,8 @@ def make_response(reply: str):
 
 def normalize_phone(phone: str):
     phone = (phone or "").strip().replace(" ", "")
-
     if phone.startswith("0"):
         phone = "+27" + phone[1:]
-
     return phone
 
 
@@ -63,6 +54,15 @@ def reminder_message(customer_name: str, amount_rands: int):
         f"Hi {customer_name}, this is a friendly reminder that you have "
         f"an outstanding balance of R{amount_rands}. "
         "Please let us know once payment is made."
+    )
+
+
+def payment_message(customer_name: str, amount_rands: int):
+    return (
+        f"Hi {customer_name},\n\n"
+        f"You have an outstanding balance of R{amount_rands}.\n\n"
+        f"Please complete payment here:\n{PAYMENT_LINK}\n\n"
+        "Thank you."
     )
 
 
@@ -81,9 +81,14 @@ def send_whatsapp(to: str, message: str):
         return False, str(e)
 
 
-# -------------------------
-# MAIN WEBHOOK
-# -------------------------
+def find_debt_by_name(debts, name: str):
+    name = (name or "").strip().lower()
+    for d in debts:
+        if name in (d.creditor_name or "").lower():
+            return d
+    return None
+
+
 @router.post("/webhooks/whatsapp")
 async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     data = await request.form()
@@ -91,9 +96,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     text = str(data.get("Body") or "").strip()
     phone = str(data.get("From") or "").replace("whatsapp:", "").strip()
 
-    # -------------------------
-    # USER
-    # -------------------------
     db_user = db.query(User).filter(User.phone_e164 == phone).one_or_none()
 
     if not db_user:
@@ -105,25 +107,17 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     step = get_step(db, db_user.id)
     scratch = get_scratch(db, db_user.id)
 
-    # -------------------------
-    # GREETING
-    # -------------------------
     if text.lower() in {"hi", "hello", "hey", "start"}:
         set_step(db, db_user.id, "consent")
-
         return make_response(
             "Hi! I’m DebtCoach AI for businesses.\n"
-            "I help you track customers who owe you and send reminders.\n\n"
+            "I help you track customers who owe you, send reminders, and share payment links.\n\n"
             "Reply YES to continue."
         )
 
-    # -------------------------
-    # CONSENT
-    # -------------------------
     if step == "consent":
         if text.lower() in {"yes", "y"}:
             set_step(db, db_user.id, "business_ready")
-
             return make_response(
                 "You're set.\n\n"
                 "Commands:\n"
@@ -132,23 +126,19 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 "SUMMARY\n"
                 "REMIND <name>\n"
                 "REMIND John, Tshepo\n"
-                "REMIND ALL"
+                "REMIND ALL\n"
+                "PAY <name>"
             )
 
         return make_response("Reply YES to continue.")
 
-    # -------------------------
-    # MAIN MODE
-    # -------------------------
     if step == "business_ready":
         upper_text = text.upper()
 
-        # ADD
         if upper_text == "ADD":
             set_step(db, db_user.id, "add_name")
             return make_response("Send customer name.")
 
-        # LIST
         if upper_text in {"LIST", "DEBTS"}:
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
@@ -167,7 +157,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             lines.append(f"\nTotal owed: R{total}")
             return make_response("\n".join(lines))
 
-        # SUMMARY
         if upper_text == "SUMMARY":
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
@@ -181,7 +170,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 f"Customers owe you R{total} across {count} account(s)."
             )
 
-        # RESET
         if upper_text == "RESET":
             db.query(Debt).filter(Debt.user_id == db_user.id).delete()
             db.commit()
@@ -189,30 +177,54 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             return make_response("All customer data cleared.")
 
         # -------------------------
+        # PAY COMMAND
+        # -------------------------
+        if upper_text.startswith("PAY"):
+            command = text[3:].strip()
+
+            if not command:
+                return make_response("Use:\nPAY John")
+
+            debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
+            match = find_debt_by_name(debts, command)
+
+            if not match:
+                return make_response(f"No customer found for '{command}'.")
+
+            if not match.phone_number:
+                return make_response(f"{match.creditor_name} has no phone number saved.")
+
+            amount = match.balance_cents // 100
+
+            ok, error = send_whatsapp(
+                match.phone_number,
+                payment_message(match.creditor_name, amount),
+            )
+
+            if ok:
+                return make_response(f"Payment link sent to {match.creditor_name}.")
+
+            return make_response(f"Failed to send payment link to {match.creditor_name}.")
+
+        # -------------------------
         # REMIND LOGIC
         # -------------------------
         if upper_text.startswith("REMIND"):
             command = text[6:].strip()
-
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
 
             if not debts:
                 return make_response("No customers to remind.")
 
             if not command:
-                return make_response(
-                    "Use:\nREMIND John\nREMIND John, Tshepo\nREMIND ALL"
-                )
+                return make_response("Use:\nREMIND John\nREMIND John, Tshepo\nREMIND ALL")
 
-            # REMIND ALL
             if command.upper() == "ALL":
                 sent = []
                 failed = []
-                skipped = []
 
                 for d in debts:
                     if d.balance_cents <= 0:
-                        skipped.append(d.creditor_name)
                         continue
 
                     if not d.phone_number:
@@ -241,7 +253,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
 
                 return make_response("\n".join(reply_parts))
 
-            # REMIND ONE OR MULTIPLE
             requested_names = [n.strip().lower() for n in command.split(",") if n.strip()]
 
             sent = []
@@ -249,12 +260,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             failed = []
 
             for name in requested_names:
-                match = None
-
-                for d in debts:
-                    if name in (d.creditor_name or "").lower():
-                        match = d
-                        break
+                match = find_debt_by_name(debts, name)
 
                 if not match:
                     not_found.append(name)
@@ -289,12 +295,16 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             )
 
         return make_response(
-            "Commands:\nADD\nLIST\nSUMMARY\nREMIND <name>\nREMIND John, Tshepo\nREMIND ALL"
+            "Commands:\n"
+            "ADD\n"
+            "LIST\n"
+            "SUMMARY\n"
+            "REMIND <name>\n"
+            "REMIND John, Tshepo\n"
+            "REMIND ALL\n"
+            "PAY <name>"
         )
 
-    # -------------------------
-    # ADD FLOW
-    # -------------------------
     if step == "add_name":
         update_scratch(db, db_user.id, name=text)
         set_step(db, db_user.id, "add_phone")

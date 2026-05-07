@@ -1,5 +1,5 @@
 # app/models.py
-from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime
+from sqlalchemy import Column, Integer, String, BigInteger, ForeignKey, DateTime, Boolean
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.sql import func
 from sqlalchemy import DateTime
@@ -36,3 +36,11 @@ class Payment(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     amount_cents = Column(BigInteger, nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Reminder(Base):
+    __tablename__ = "reminders"
+
+    id = Column(Integer, primary_key=True)
+    debt_id = Column(Integer, ForeignKey("debts.id"), nullable=False)
+    send_at = Column(DateTime(timezone=True), nullable=False)
+    sent = Column(Boolean, default=False, nullable=False)
