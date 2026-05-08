@@ -22,12 +22,20 @@ PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://debtcoach.online/pay")
 
 AMOUNT_RE = re.compile(r"(?i)\b(?:r\s*)?(\d[\d\s,\.]*)\b")
 
+VALID_SA_MOBILE_PREFIXES = {
+    "60", "61", "62", "63", "64", "65", "66", "67", "68",
+    "71", "72", "73", "74", "76", "78", "79",
+    "81", "82", "83", "84",
+}
+
 
 def parse_amount(text: str):
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
+
     raw = m.group(1).replace(" ", "").replace(",", "")
+
     try:
         return int(float(raw))
     except Exception:
@@ -44,8 +52,24 @@ def make_response(reply: str):
 
 def normalize_phone(phone: str):
     phone = (phone or "").strip().replace(" ", "")
+
+    if not phone:
+        return None
+
     if phone.startswith("0"):
         phone = "+27" + phone[1:]
+
+    if not phone.startswith("+27"):
+        return None
+
+    digits = phone[3:]
+
+    if len(digits) != 9:
+        return None
+
+    if digits[:2] not in VALID_SA_MOBILE_PREFIXES:
+        return None
+
     return phone
 
 
@@ -67,12 +91,15 @@ def payment_message(customer_name: str, amount_rands: int):
 
 
 def send_whatsapp(to: str, message: str):
-    to = normalize_phone(to)
+    clean_to = normalize_phone(to)
+
+    if not clean_to:
+        return False, "Invalid phone number"
 
     try:
         twilio_client.messages.create(
             from_=TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{to}",
+            to=f"whatsapp:{clean_to}",
             body=message,
         )
         return True, None
@@ -83,9 +110,11 @@ def send_whatsapp(to: str, message: str):
 
 def find_debt_by_name(debts, name: str):
     name = (name or "").strip().lower()
+
     for d in debts:
         if name in (d.creditor_name or "").lower():
             return d
+
     return None
 
 
@@ -105,10 +134,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
         db.refresh(db_user)
 
     step = get_step(db, db_user.id)
-    scratch = get_scratch(db, db_user.id)
 
     if text.lower() in {"hi", "hello", "hey", "start"}:
         set_step(db, db_user.id, "consent")
+
         return make_response(
             "Hi! I’m DebtCoach AI for businesses.\n"
             "I help you track customers who owe you, send reminders, and share payment links.\n\n"
@@ -118,6 +147,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     if step == "consent":
         if text.lower() in {"yes", "y"}:
             set_step(db, db_user.id, "business_ready")
+
             return make_response(
                 "You're set.\n\n"
                 "Commands:\n"
@@ -149,10 +179,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             total = 0
 
             for d in debts:
-                amt = d.balance_cents // 100
-                total += amt
+                amount = d.balance_cents // 100
+                total += amount
                 phone_display = d.phone_number or "No phone"
-                lines.append(f"• {d.creditor_name} – R{amt} ({phone_display})")
+                lines.append(f"• {d.creditor_name} – R{amount} ({phone_display})")
 
             lines.append(f"\nTotal owed: R{total}")
             return make_response("\n".join(lines))
@@ -176,9 +206,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             set_step(db, db_user.id, "business_ready")
             return make_response("All customer data cleared.")
 
-        # -------------------------
-        # PAY COMMAND
-        # -------------------------
         if upper_text.startswith("PAY"):
             command = text[3:].strip()
 
@@ -195,7 +222,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 return make_response(f"{match.creditor_name} has no phone number saved.")
 
             amount = match.balance_cents // 100
-
             ok, error = send_whatsapp(
                 match.phone_number,
                 payment_message(match.creditor_name, amount),
@@ -204,11 +230,8 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
             if ok:
                 return make_response(f"Payment link sent to {match.creditor_name}.")
 
-            return make_response(f"Failed to send payment link to {match.creditor_name}.")
+            return make_response(f"Failed to send payment link to {match.creditor_name}: {error}")
 
-        # -------------------------
-        # REMIND LOGIC
-        # -------------------------
         if upper_text.startswith("REMIND"):
             command = text[6:].strip()
             debts = db.query(Debt).filter(Debt.user_id == db_user.id).all()
@@ -240,7 +263,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                     if ok:
                         sent.append(d.creditor_name)
                     else:
-                        failed.append(d.creditor_name)
+                        failed.append(f"{d.creditor_name} ({error})")
 
                 reply_parts = []
 
@@ -254,7 +277,6 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 return make_response("\n".join(reply_parts))
 
             requested_names = [n.strip().lower() for n in command.split(",") if n.strip()]
-
             sent = []
             not_found = []
             failed = []
@@ -279,7 +301,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 if ok:
                     sent.append(match.creditor_name)
                 else:
-                    failed.append(match.creditor_name)
+                    failed.append(f"{match.creditor_name} ({error})")
 
             reply_parts = []
 
@@ -308,10 +330,16 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
     if step == "add_name":
         update_scratch(db, db_user.id, name=text)
         set_step(db, db_user.id, "add_phone")
-        return make_response("Send phone number (e.g. +27712345678).")
+        return make_response("Send phone number, e.g. +27712345678 or 0712345678.")
 
     if step == "add_phone":
         clean_phone = normalize_phone(text)
+
+        if not clean_phone:
+            return make_response(
+                "Invalid phone number. Use a valid South African mobile number, e.g. +27712345678 or 0712345678."
+            )
+
         update_scratch(db, db_user.id, phone=clean_phone)
         set_step(db, db_user.id, "add_amount")
         return make_response("Send amount owed.")
@@ -320,7 +348,7 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
         amount = parse_amount(text)
 
         if amount is None or amount <= 0:
-            return make_response("Send a valid amount.")
+            return make_response("Send a valid amount greater than 0.")
 
         scratch = get_scratch(db, db_user.id)
         name = scratch.get("name")
