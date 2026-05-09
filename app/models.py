@@ -9,9 +9,12 @@ class User(Base):
     __tablename__ = "users"
 
     id = Column(Integer, primary_key=True)
-    phone_e164 = Column(String(32), unique=True, nullable=False)
+    phone_e164 = Column(String(32), unique=True, nullable=True)
+    email = Column(String(255), unique=True, nullable=True)
+    business_name = Column(String(128), nullable=True)
+    password_hash = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
-    last_payment_at = Column(DateTime, default=None) 
+    last_payment_at = Column(DateTime, default=None)
 
 class ConvoState(Base):
     __tablename__ = "convo_state"

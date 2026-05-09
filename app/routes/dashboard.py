@@ -1,45 +1,14 @@
-import os
-import secrets
-
-from fastapi import APIRouter, Depends, Form, Request, HTTPException
+from fastapi import APIRouter, Depends, Form, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from sqlalchemy.orm import Session
 from html import escape
 
 from ..db import get_db
-from ..models import User, Debt
+from ..models import Debt
+from .auth import get_current_user
 from .whatsapp import send_whatsapp, reminder_message, payment_message, normalize_phone
 
 router = APIRouter()
-security = HTTPBasic()
-
-
-def require_login(credentials: HTTPBasicCredentials = Depends(security)):
-    expected_user = os.getenv("DASHBOARD_USER", "admin")
-    expected_pass = os.getenv("DASHBOARD_PASSWORD", "changeme")
-
-    ok_user = secrets.compare_digest(credentials.username, expected_user)
-    ok_pass = secrets.compare_digest(credentials.password, expected_pass)
-
-    if not (ok_user and ok_pass):
-        raise HTTPException(
-            status_code=401,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Basic"},
-        )
-
-
-def get_dashboard_user(db: Session):
-    user = db.query(User).order_by(User.id.asc()).first()
-
-    if not user:
-        user = User(phone_e164="+27000000000")
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-    return user
 
 
 def money(cents: int):
@@ -53,9 +22,13 @@ def dashboard(
     error: str = "",
     success: str = "",
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
-    debts = db.query(Debt).all()
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debts = db.query(Debt).filter(Debt.user_id == current_user.id).all()
 
     if q:
         debts = [
@@ -92,6 +65,8 @@ def dashboard(
         message = "<div class='alert error'>Invalid phone number. Use +27712345678 or 0712345678.</div>"
     elif error == "invalid_amount":
         message = "<div class='alert error'>Amount must be greater than 0.</div>"
+    elif error == "send_failed":
+        message = "<div class='alert error'>Message failed. Check phone number or Twilio logs.</div>"
     elif success == "added":
         message = "<div class='alert success'>Customer added.</div>"
     elif success == "deleted":
@@ -100,8 +75,6 @@ def dashboard(
         message = "<div class='alert success'>Customer marked as paid.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
-    elif error == "send_failed":
-        message = "<div class='alert error'>Message failed to send. Check phone number or Twilio logs.</div>"
 
     rows = ""
 
@@ -112,8 +85,8 @@ def dashboard(
 
         rows += f"""
         <tr>
-            <td>{c["name"]}</td>
-            <td>{phone}</td>
+            <td>{escape(c["name"] or "")}</td>
+            <td>{escape(phone)}</td>
             <td>R{amount}</td>
             <td class="actions">
                 <form method="post" action="/dashboard/remind/{debt_id}">
@@ -135,6 +108,8 @@ def dashboard(
         </tr>
         """
 
+    business_name = current_user.business_name or "DebtCoach"
+
     html = f"""
     <!DOCTYPE html>
     <html>
@@ -147,6 +122,13 @@ def dashboard(
                 color: white;
                 margin: 0;
                 padding: 40px;
+            }}
+
+            .top {{
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 20px;
             }}
 
             h1 {{
@@ -258,12 +240,21 @@ def dashboard(
                 background: #14532d;
                 color: #bbf7d0;
             }}
+
+            a {{
+                color: #93c5fd;
+            }}
         </style>
     </head>
 
     <body>
-        <h1>DebtCoach Dashboard</h1>
-        <div class="subtitle">Business collections overview</div>
+        <div class="top">
+            <div>
+                <h1>DebtCoach Dashboard</h1>
+                <div class="subtitle">{escape(business_name)} collections overview</div>
+            </div>
+            <a href="/logout">Logout</a>
+        </div>
 
         {message}
 
@@ -287,7 +278,7 @@ def dashboard(
             <form method="get" action="/dashboard">
                 <input name="q" placeholder="Search name or phone" value="{escape(q)}">
                 <button class="btn blue">Search</button>
-                <a href="/dashboard" style="color:#93c5fd;margin-left:10px;">Clear</a>
+                <a href="/dashboard" style="margin-left:10px;">Clear</a>
             </form>
         </div>
 
@@ -311,12 +302,17 @@ def dashboard(
 
 @router.post("/dashboard/add")
 def add_customer(
+    request: Request,
     name: str = Form(...),
     phone: str = Form(""),
     amount: int = Form(...),
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
     if amount <= 0:
         return RedirectResponse("/dashboard?error=invalid_amount", status_code=303)
 
@@ -325,10 +321,8 @@ def add_customer(
     if phone and not clean_phone:
         return RedirectResponse("/dashboard?error=invalid_phone", status_code=303)
 
-    user = get_dashboard_user(db)
-
     debt = Debt(
-        user_id=user.id,
+        user_id=current_user.id,
         creditor_name=name.strip(),
         phone_number=clean_phone,
         balance_cents=amount * 100,
@@ -342,11 +336,19 @@ def add_customer(
 
 @router.post("/dashboard/remind/{debt_id}")
 def dashboard_remind(
+    request: Request,
     debt_id: int,
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
-    debt = db.query(Debt).filter(Debt.id == debt_id).first()
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
 
     if debt and debt.phone_number and debt.balance_cents > 0:
         amount = debt.balance_cents // 100
@@ -363,11 +365,19 @@ def dashboard_remind(
 
 @router.post("/dashboard/pay/{debt_id}")
 def dashboard_pay(
+    request: Request,
     debt_id: int,
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
-    debt = db.query(Debt).filter(Debt.id == debt_id).first()
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
 
     if debt and debt.phone_number and debt.balance_cents > 0:
         amount = debt.balance_cents // 100
@@ -384,11 +394,19 @@ def dashboard_pay(
 
 @router.post("/dashboard/paid/{debt_id}")
 def dashboard_paid(
+    request: Request,
     debt_id: int,
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
-    debt = db.query(Debt).filter(Debt.id == debt_id).first()
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
 
     if debt:
         debt.balance_cents = 0
@@ -400,11 +418,19 @@ def dashboard_paid(
 
 @router.post("/dashboard/delete/{debt_id}")
 def dashboard_delete(
+    request: Request,
     debt_id: int,
     db: Session = Depends(get_db),
-    _: None = Depends(require_login),
 ):
-    debt = db.query(Debt).filter(Debt.id == debt_id).first()
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
 
     if debt:
         db.delete(debt)
