@@ -41,7 +41,9 @@ def parse_amount(text: str):
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
+
     raw = m.group(1).replace(" ", "").replace(",", "")
+
     try:
         return int(float(raw))
     except Exception:
@@ -54,6 +56,13 @@ def make_response(reply: str):
         f"<Response><Message>{escape(reply)}</Message></Response>"
     )
     return PlainTextResponse(content=xml, media_type="application/xml")
+
+
+def empty_twilio_response():
+    return PlainTextResponse(
+        content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+        media_type="application/xml",
+    )
 
 
 def normalize_phone(phone: str):
@@ -99,33 +108,11 @@ def send_template(to: str, content_sid: str, variables: dict):
         return False, str(e)
 
 
-def send_whatsapp(to: str, message: str):
-    clean_to = normalize_phone(to)
-
-    if not clean_to:
-        return False, "Invalid phone number"
-
-    try:
-        msg = twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{clean_to}",
-            body=message,
-        )
-        print("TWILIO MESSAGE SID:", msg.sid)
-        return True, None
-    except Exception as e:
-        print("TWILIO SEND ERROR:", str(e))
-        return False, str(e)
-
-
 def send_payment_reminder(name: str, phone: str, amount: int):
     return send_template(
         phone,
         PAYMENT_REMINDER_SID,
-        {
-            "1": name,
-            "2": str(amount),
-        },
+        {"1": name, "2": str(amount)},
     )
 
 
@@ -133,10 +120,7 @@ def send_final_reminder(name: str, phone: str, amount: int):
     return send_template(
         phone,
         FINAL_REMINDER_SID,
-        {
-            "1": name,
-            "2": str(amount),
-        },
+        {"1": name, "2": str(amount)},
     )
 
 
@@ -144,10 +128,7 @@ def send_payment_link(name: str, phone: str, amount: int):
     return send_template(
         phone,
         PAYMENT_LINK_SID,
-        {
-            "1": name,
-            "2": str(amount),
-        },
+        {"1": name, "2": str(amount)},
     )
 
 
@@ -155,27 +136,15 @@ def send_payment_received(name: str, phone: str, amount: int):
     return send_template(
         phone,
         PAYMENT_RECEIVED_SID,
-        {
-            "1": name,
-            "2": str(amount),
-        },
+        {"1": name, "2": str(amount)},
     )
 
 
-def reminder_message(customer_name: str, amount_rands: int):
-    return (
-        f"Hi {customer_name}, this is a friendly reminder that you have "
-        f"an outstanding balance of R{amount_rands}. "
-        "Please reply once payment is made."
-    )
-
-
-def payment_message(customer_name: str, amount_rands: int):
-    return (
-        f"Hi {customer_name},\n\n"
-        f"You have an outstanding balance of R{amount_rands}.\n\n"
-        f"Please complete payment here:\n{PAYMENT_LINK}\n\n"
-        "Thank you."
+def send_consent_request(phone: str):
+    return send_template(
+        phone,
+        CONSENT_REQUEST_SID,
+        {},
     )
 
 
@@ -208,15 +177,18 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
 
     if text.lower() in {"hi", "hello", "hey", "start"}:
         set_step(db, db_user.id, "consent")
-        return make_response(
-            "Hi 👋 I’m DebtCoach AI.\n\n"
-            "I help businesses track customer debts, send reminders, and collect payments on WhatsApp.\n\n"
-            "Do you want to continue?"
-        )
+
+        ok, error = send_consent_request(phone)
+
+        if ok:
+            return empty_twilio_response()
+
+        return make_response("Hi 👋 I’m DebtCoach AI.\n\nReply YES to continue.")
 
     if step == "consent":
         if text.lower() in {"yes", "y"}:
             set_step(db, db_user.id, "business_ready")
+
             return make_response(
                 "You're set.\n\n"
                 "Commands:\n"
@@ -227,6 +199,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 "REMIND ALL - remind everyone\n"
                 "PAY John - send payment link"
             )
+
+        if text.lower() in {"no", "n"}:
+            set_step(db, db_user.id, "start")
+            return make_response("No problem. Message HI anytime to start again.")
 
         return make_response("Reply YES to continue.")
 
