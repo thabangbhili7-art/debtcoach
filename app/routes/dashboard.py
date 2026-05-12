@@ -6,7 +6,12 @@ from html import escape
 from ..db import get_db
 from ..models import Debt
 from .auth import get_current_user
-from .whatsapp import send_whatsapp, reminder_message, payment_message, normalize_phone
+from .whatsapp import (
+    normalize_phone,
+    send_payment_reminder,
+    send_payment_link,
+    send_payment_received,
+)
 
 router = APIRouter()
 
@@ -72,7 +77,7 @@ def dashboard(
     elif success == "deleted":
         message = "<div class='alert success'>Customer deleted.</div>"
     elif success == "paid":
-        message = "<div class='alert success'>Customer marked as paid.</div>"
+        message = "<div class='alert success'>Customer marked as paid and confirmation sent.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
 
@@ -352,9 +357,10 @@ def dashboard_remind(
 
     if debt and debt.phone_number and debt.balance_cents > 0:
         amount = debt.balance_cents // 100
-        ok, error = send_whatsapp(
+        ok, error = send_payment_reminder(
+            debt.creditor_name,
             debt.phone_number,
-            reminder_message(debt.creditor_name, amount),
+            amount,
         )
 
         if ok:
@@ -381,9 +387,10 @@ def dashboard_pay(
 
     if debt and debt.phone_number and debt.balance_cents > 0:
         amount = debt.balance_cents // 100
-        ok, error = send_whatsapp(
+        ok, error = send_payment_link(
+            debt.creditor_name,
             debt.phone_number,
-            payment_message(debt.creditor_name, amount),
+            amount,
         )
 
         if ok:
@@ -409,6 +416,15 @@ def dashboard_paid(
     ).first()
 
     if debt:
+        amount = debt.balance_cents // 100
+
+        if debt.phone_number and amount > 0:
+            send_payment_received(
+                debt.creditor_name,
+                debt.phone_number,
+                amount,
+            )
+
         debt.balance_cents = 0
         db.add(debt)
         db.commit()

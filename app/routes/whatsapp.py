@@ -2,9 +2,10 @@ from fastapi import APIRouter, Request, Depends
 from fastapi.responses import PlainTextResponse
 from sqlalchemy.orm import Session
 import re
+import os
+import json
 from html import escape
 from twilio.rest import Client
-import os
 
 from ..db import get_db
 from ..state_db import get_step, set_step, get_scratch, update_scratch
@@ -20,6 +21,13 @@ twilio_client = Client(
 TWILIO_WHATSAPP_NUMBER = "whatsapp:+12312725816"
 PAYMENT_LINK = os.getenv("PAYMENT_LINK", "https://debtcoach.online/pay")
 
+PAYMENT_REMINDER_SID = "HX63157ef79d57913569521535e396af35"
+FINAL_REMINDER_SID = "HXba133d6940bfef28577e385005c4cf92"
+PAYMENT_LINK_SID = "HXacc4980c80ab5f0a1fca7cb01221e5eb"
+CONSENT_REQUEST_SID = "HXce82ce3a4b0f032d6f0a120c076920e6"
+DEBT_CONSENT_SID = "HX054b382f7b22aae4159cc83b05cbf2a4"
+PAYMENT_RECEIVED_SID = "HX2871dd1654529f46283a791d9767dd0c"
+
 AMOUNT_RE = re.compile(r"(?i)\b(?:r\s*)?(\d[\d\s,\.]*)\b")
 
 VALID_SA_MOBILE_PREFIXES = {
@@ -33,9 +41,7 @@ def parse_amount(text: str):
     m = AMOUNT_RE.search(text or "")
     if not m:
         return None
-
     raw = m.group(1).replace(" ", "").replace(",", "")
-
     try:
         return int(float(raw))
     except Exception:
@@ -73,11 +79,94 @@ def normalize_phone(phone: str):
     return phone
 
 
+def send_template(to: str, content_sid: str, variables: dict):
+    clean_to = normalize_phone(to)
+
+    if not clean_to:
+        return False, "Invalid phone number"
+
+    try:
+        msg = twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=f"whatsapp:{clean_to}",
+            content_sid=content_sid,
+            content_variables=json.dumps(variables),
+        )
+        print("TWILIO TEMPLATE SID:", msg.sid)
+        return True, None
+    except Exception as e:
+        print("TWILIO TEMPLATE ERROR:", str(e))
+        return False, str(e)
+
+
+def send_whatsapp(to: str, message: str):
+    clean_to = normalize_phone(to)
+
+    if not clean_to:
+        return False, "Invalid phone number"
+
+    try:
+        msg = twilio_client.messages.create(
+            from_=TWILIO_WHATSAPP_NUMBER,
+            to=f"whatsapp:{clean_to}",
+            body=message,
+        )
+        print("TWILIO MESSAGE SID:", msg.sid)
+        return True, None
+    except Exception as e:
+        print("TWILIO SEND ERROR:", str(e))
+        return False, str(e)
+
+
+def send_payment_reminder(name: str, phone: str, amount: int):
+    return send_template(
+        phone,
+        PAYMENT_REMINDER_SID,
+        {
+            "1": name,
+            "2": str(amount),
+        },
+    )
+
+
+def send_final_reminder(name: str, phone: str, amount: int):
+    return send_template(
+        phone,
+        FINAL_REMINDER_SID,
+        {
+            "1": name,
+            "2": str(amount),
+        },
+    )
+
+
+def send_payment_link(name: str, phone: str, amount: int):
+    return send_template(
+        phone,
+        PAYMENT_LINK_SID,
+        {
+            "1": name,
+            "2": str(amount),
+        },
+    )
+
+
+def send_payment_received(name: str, phone: str, amount: int):
+    return send_template(
+        phone,
+        PAYMENT_RECEIVED_SID,
+        {
+            "1": name,
+            "2": str(amount),
+        },
+    )
+
+
 def reminder_message(customer_name: str, amount_rands: int):
     return (
         f"Hi {customer_name}, this is a friendly reminder that you have "
         f"an outstanding balance of R{amount_rands}. "
-        "Please let us know once payment is made."
+        "Please reply once payment is made."
     )
 
 
@@ -88,24 +177,6 @@ def payment_message(customer_name: str, amount_rands: int):
         f"Please complete payment here:\n{PAYMENT_LINK}\n\n"
         "Thank you."
     )
-
-
-def send_whatsapp(to: str, message: str):
-    clean_to = normalize_phone(to)
-
-    if not clean_to:
-        return False, "Invalid phone number"
-
-    try:
-        twilio_client.messages.create(
-            from_=TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{clean_to}",
-            body=message,
-        )
-        return True, None
-    except Exception as e:
-        print("TWILIO SEND ERROR:", str(e))
-        return False, str(e)
 
 
 def find_debt_by_name(debts, name: str):
@@ -137,27 +208,24 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
 
     if text.lower() in {"hi", "hello", "hey", "start"}:
         set_step(db, db_user.id, "consent")
-
         return make_response(
-            "Hi! I’m DebtCoach AI for businesses.\n"
-            "I help you track customers who owe you, send reminders, and share payment links.\n\n"
-            "Reply YES to continue."
+            "Hi 👋 I’m DebtCoach AI.\n\n"
+            "I help businesses track customer debts, send reminders, and collect payments on WhatsApp.\n\n"
+            "Do you want to continue?"
         )
 
     if step == "consent":
         if text.lower() in {"yes", "y"}:
             set_step(db, db_user.id, "business_ready")
-
             return make_response(
                 "You're set.\n\n"
                 "Commands:\n"
-                "ADD\n"
-                "LIST\n"
-                "SUMMARY\n"
-                "REMIND <name>\n"
-                "REMIND John, Tshepo\n"
-                "REMIND ALL\n"
-                "PAY <name>"
+                "ADD - add a customer\n"
+                "LIST - view customers\n"
+                "SUMMARY - total owed\n"
+                "REMIND John - send reminder\n"
+                "REMIND ALL - remind everyone\n"
+                "PAY John - send payment link"
             )
 
         return make_response("Reply YES to continue.")
@@ -222,15 +290,12 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                 return make_response(f"{match.creditor_name} has no phone number saved.")
 
             amount = match.balance_cents // 100
-            ok, error = send_whatsapp(
-                match.phone_number,
-                payment_message(match.creditor_name, amount),
-            )
+            ok, error = send_payment_link(match.creditor_name, match.phone_number, amount)
 
             if ok:
                 return make_response(f"Payment link sent to {match.creditor_name}.")
 
-            return make_response(f"Failed to send payment link to {match.creditor_name}: {error}")
+            return make_response(f"Failed to send payment link: {error}")
 
         if upper_text.startswith("REMIND"):
             command = text[6:].strip()
@@ -255,9 +320,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                         continue
 
                     amount = d.balance_cents // 100
-                    ok, error = send_whatsapp(
+                    ok, error = send_payment_reminder(
+                        d.creditor_name,
                         d.phone_number,
-                        reminder_message(d.creditor_name, amount),
+                        amount,
                     )
 
                     if ok:
@@ -293,9 +359,10 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
                     continue
 
                 amount = match.balance_cents // 100
-                ok, error = send_whatsapp(
+                ok, error = send_payment_reminder(
+                    match.creditor_name,
                     match.phone_number,
-                    reminder_message(match.creditor_name, amount),
+                    amount,
                 )
 
                 if ok:
@@ -318,13 +385,12 @@ async def whatsapp_webhook(request: Request, db: Session = Depends(get_db)):
 
         return make_response(
             "Commands:\n"
-            "ADD\n"
-            "LIST\n"
-            "SUMMARY\n"
-            "REMIND <name>\n"
-            "REMIND John, Tshepo\n"
-            "REMIND ALL\n"
-            "PAY <name>"
+            "ADD - add a customer\n"
+            "LIST - view customers\n"
+            "SUMMARY - total owed\n"
+            "REMIND John - send reminder\n"
+            "REMIND ALL - remind everyone\n"
+            "PAY John - send payment link"
         )
 
     if step == "add_name":
