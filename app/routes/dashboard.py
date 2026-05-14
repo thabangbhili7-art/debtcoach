@@ -71,13 +71,13 @@ def dashboard(
     elif error == "invalid_amount":
         message = "<div class='alert error'>Amount must be greater than 0.</div>"
     elif error == "send_failed":
-        message = "<div class='alert error'>Message failed. Check phone number or Twilio logs.</div>"
+        message = "<div class='alert error'>Message failed. Check phone number, template approval, or Twilio logs.</div>"
     elif success == "added":
         message = "<div class='alert success'>Customer added.</div>"
     elif success == "deleted":
         message = "<div class='alert success'>Customer deleted.</div>"
     elif success == "paid":
-        message = "<div class='alert success'>Customer marked as paid and confirmation sent.</div>"
+        message = "<div class='alert success'>Customer marked as paid.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
 
