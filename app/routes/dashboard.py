@@ -1,7 +1,10 @@
-from fastapi import APIRouter, Depends, Form, Request
+import csv
+import io
+from html import escape
+
+from fastapi import APIRouter, Depends, Form, Request, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
-from html import escape
 
 from ..db import get_db
 from ..models import Debt
@@ -26,6 +29,7 @@ def dashboard(
     q: str = "",
     error: str = "",
     success: str = "",
+    count: str = "",
     db: Session = Depends(get_db),
 ):
     current_user = get_current_user(request, db)
@@ -72,6 +76,8 @@ def dashboard(
         message = "<div class='alert error'>Amount must be greater than 0.</div>"
     elif error == "send_failed":
         message = "<div class='alert error'>Message failed. Check phone number, template approval, or Twilio logs.</div>"
+    elif error == "csv_failed":
+        message = "<div class='alert error'>CSV upload failed. Use columns: name, phone, amount.</div>"
     elif success == "added":
         message = "<div class='alert success'>Customer added.</div>"
     elif success == "deleted":
@@ -80,6 +86,8 @@ def dashboard(
         message = "<div class='alert success'>Customer marked as paid.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
+    elif success == "uploaded":
+        message = f"<div class='alert success'>CSV uploaded successfully. Imported {escape(count or '0')} customer(s).</div>"
 
     rows = ""
 
@@ -249,6 +257,12 @@ def dashboard(
             a {{
                 color: #93c5fd;
             }}
+
+            .hint {{
+                color: #94a3b8;
+                font-size: 14px;
+                margin-top: 4px;
+            }}
         </style>
     </head>
 
@@ -276,6 +290,16 @@ def dashboard(
                 <input name="phone" placeholder="+27712345678">
                 <input name="amount" placeholder="Amount" type="number" min="1" required>
                 <button class="btn green">Add</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <h2>Bulk Upload CSV</h2>
+            <div class="hint">CSV columns required: name, phone, amount</div>
+            <br>
+            <form method="post" action="/dashboard/upload" enctype="multipart/form-data">
+                <input name="file" type="file" accept=".csv" required>
+                <button class="btn green">Upload CSV</button>
             </form>
         </div>
 
@@ -337,6 +361,73 @@ def add_customer(
     db.commit()
 
     return RedirectResponse("/dashboard?success=added", status_code=303)
+
+
+@router.post("/dashboard/upload")
+async def upload_csv(
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    try:
+        contents = await file.read()
+        decoded = contents.decode("utf-8-sig")
+
+        reader = csv.DictReader(io.StringIO(decoded))
+
+        required_columns = {"name", "phone", "amount"}
+
+        if not reader.fieldnames or not required_columns.issubset(set(reader.fieldnames)):
+            return RedirectResponse("/dashboard?error=csv_failed", status_code=303)
+
+        imported = 0
+
+        for row in reader:
+            name = (row.get("name") or "").strip()
+            phone = (row.get("phone") or "").strip()
+            amount_raw = (row.get("amount") or "").strip()
+
+            if not name or not amount_raw:
+                continue
+
+            try:
+                amount = int(float(amount_raw))
+            except Exception:
+                continue
+
+            if amount <= 0:
+                continue
+
+            clean_phone = normalize_phone(phone) if phone else None
+
+            if phone and not clean_phone:
+                continue
+
+            debt = Debt(
+                user_id=current_user.id,
+                creditor_name=name,
+                phone_number=clean_phone,
+                balance_cents=amount * 100,
+            )
+
+            db.add(debt)
+            imported += 1
+
+        db.commit()
+
+        return RedirectResponse(
+            f"/dashboard?success=uploaded&count={imported}",
+            status_code=303,
+        )
+
+    except Exception as e:
+        print("CSV UPLOAD ERROR:", str(e))
+        return RedirectResponse("/dashboard?error=csv_failed", status_code=303)
 
 
 @router.post("/dashboard/remind/{debt_id}")
