@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Debt, Payment
+from ..models import User, Debt, Payment
 from .auth import get_current_user
 from .whatsapp import (
     normalize_phone,
@@ -133,13 +133,8 @@ def dashboard(
             status = "No phone"
             status_class = "warning"
 
-        disabled_phone_actions = ""
-        if not c["phone"]:
-            disabled_phone_actions = "disabled"
-
-        disabled_paid_actions = ""
-        if remaining <= 0:
-            disabled_paid_actions = "disabled"
+        disabled_phone_actions = "disabled" if not c["phone"] else ""
+        disabled_paid_actions = "disabled" if remaining <= 0 else ""
 
         rows += f"""
         <tr>
@@ -501,7 +496,10 @@ def dashboard(
                 <h1>DebtCoach Dashboard</h1>
                 <div class="subtitle">{escape(business_name)} collections overview</div>
             </div>
-            <a href="/logout">Logout</a>
+            <div>
+                <a href="/settings" style="margin-right:16px;">Settings</a>
+                <a href="/logout">Logout</a>
+            </div>
         </div>
 
         {message}
@@ -570,6 +568,156 @@ def dashboard(
     """
 
     return html
+
+
+@router.get("/settings", response_class=HTMLResponse)
+def settings_page(
+    request: Request,
+    success: str = "",
+    error: str = "",
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    message = ""
+
+    if success == "updated":
+        message = "<div class='alert success'>Settings updated.</div>"
+    elif error == "invalid_phone":
+        message = "<div class='alert error'>Invalid WhatsApp number.</div>"
+    elif error == "phone_taken":
+        message = "<div class='alert error'>That WhatsApp number is already linked to another business.</div>"
+
+    html = f"""
+    <html>
+    <head>
+        <title>DebtCoach Settings</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #0f172a;
+                color: white;
+                padding: 40px;
+            }}
+
+            .card {{
+                background: #1e293b;
+                padding: 28px;
+                border-radius: 16px;
+                border: 1px solid #334155;
+                max-width: 520px;
+            }}
+
+            input {{
+                width: 100%;
+                padding: 14px;
+                margin-top: 10px;
+                margin-bottom: 16px;
+                border-radius: 10px;
+                border: 1px solid #334155;
+                background: #0f172a;
+                color: white;
+                box-sizing: border-box;
+            }}
+
+            button {{
+                background: #16a34a;
+                color: white;
+                border: none;
+                padding: 12px 16px;
+                border-radius: 8px;
+                font-weight: bold;
+                cursor: pointer;
+            }}
+
+            a {{
+                color: #93c5fd;
+            }}
+
+            .alert {{
+                padding: 14px;
+                border-radius: 10px;
+                margin-bottom: 16px;
+                font-weight: bold;
+            }}
+
+            .success {{
+                background: #14532d;
+                color: #bbf7d0;
+            }}
+
+            .error {{
+                background: #7f1d1d;
+                color: #fecaca;
+            }}
+
+            label {{
+                color: #cbd5e1;
+                font-weight: bold;
+            }}
+        </style>
+    </head>
+    <body>
+        <p><a href="/dashboard">← Back to dashboard</a></p>
+
+        <div class="card">
+            <h1>Business Settings</h1>
+
+            {message}
+
+            <form method="post" action="/settings">
+                <label>Business name</label>
+                <input name="business_name" value="{escape(current_user.business_name or '')}" required>
+
+                <label>Business WhatsApp number</label>
+                <input name="phone_e164" value="{escape(current_user.phone_e164 or '')}" placeholder="+27712345678">
+
+                <button>Save Settings</button>
+            </form>
+        </div>
+    </body>
+    </html>
+    """
+
+    return html
+
+
+@router.post("/settings")
+def update_settings(
+    request: Request,
+    business_name: str = Form(...),
+    phone_e164: str = Form(""),
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    phone_clean = normalize_phone(phone_e164) if phone_e164 else None
+
+    if phone_e164 and not phone_clean:
+        return RedirectResponse("/settings?error=invalid_phone", status_code=303)
+
+    if phone_clean:
+        existing = db.query(User).filter(
+            User.phone_e164 == phone_clean,
+            User.id != current_user.id,
+        ).first()
+
+        if existing:
+            return RedirectResponse("/settings?error=phone_taken", status_code=303)
+
+    current_user.business_name = business_name.strip()
+    current_user.phone_e164 = phone_clean
+
+    db.add(current_user)
+    db.commit()
+
+    return RedirectResponse("/settings?success=updated", status_code=303)
 
 
 @router.post("/dashboard/add")

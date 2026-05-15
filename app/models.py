@@ -15,6 +15,8 @@ class User(Base):
     password_hash = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     last_payment_at = Column(DateTime, default=None)
+    is_admin = Column(Boolean, default=False, nullable=False)
+    is_active = Column(Boolean, default=True, nullable=False)
 
 class ConvoState(Base):
     __tablename__ = "convo_state"
@@ -52,3 +54,15 @@ class Reminder(Base):
     debt_id = Column(Integer, ForeignKey("debts.id"), nullable=False)
     send_at = Column(DateTime(timezone=True), nullable=False)
     sent = Column(Boolean, default=False, nullable=False)
+
+class Invite(Base):
+    __tablename__ = "invites"
+
+    id = Column(Integer, primary_key=True)
+    code = Column(String(128), unique=True, nullable=False)
+    business_name = Column(String(128), nullable=True)
+    email = Column(String(255), nullable=True)
+    used = Column(Boolean, default=False, nullable=False)
+    used_by_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
