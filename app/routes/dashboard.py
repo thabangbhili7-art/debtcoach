@@ -57,7 +57,6 @@ def dashboard(
 
     for d in debts:
         key = ((d.creditor_name or "").strip().lower(), d.phone_number or "")
-
         original = d.original_amount_cents or d.balance_cents or 0
 
         if key not in grouped:
@@ -135,41 +134,52 @@ def dashboard(
 
         rows += f"""
         <tr>
-            <td>{escape(c["name"] or "")}</td>
-            <td>{escape(phone)}</td>
-            <td>R{original}</td>
-            <td>R{paid}</td>
-            <td>R{remaining}</td>
-            <td><span class="badge {status_class}">{status}</span></td>
-            <td>{escape(format_dt(c["next_reminder_at"]))}</td>
+            <td>
+                <strong>{escape(c["name"] or "")}</strong>
+                <div class="muted">{escape(phone)}</div>
+            </td>
+
+            <td>{money(c["original_amount_cents"])}</td>
+            <td>{money(max(0, c["original_amount_cents"] - c["balance_cents"]))}</td>
+            <td><strong>{money(c["balance_cents"])}</strong></td>
+
+            <td>
+                <span class="badge {status_class}">{status}</span>
+                <div class="muted small">Next: {escape(format_dt(c["next_reminder_at"]))}</div>
+            </td>
+
             <td class="actions">
-                <form method="post" action="/dashboard/remind/{debt_id}">
-                    <button class="btn blue">Remind</button>
-                </form>
+                <div class="action-row">
+                    <form method="post" action="/dashboard/remind/{debt_id}">
+                        <button class="btn blue">Remind</button>
+                    </form>
 
-                <form method="post" action="/dashboard/pay/{debt_id}">
-                    <button class="btn green">Pay Link</button>
-                </form>
+                    <form method="post" action="/dashboard/pay/{debt_id}">
+                        <button class="btn green">Pay Link</button>
+                    </form>
 
-                <form method="post" action="/dashboard/paid/{debt_id}">
-                    <button class="btn gray">Paid</button>
-                </form>
+                    <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
+                </div>
 
-                <form method="post" action="/dashboard/payment/{debt_id}">
-                    <input name="amount" type="number" min="1" placeholder="Paid" class="small-input" required>
-                    <button class="btn green">Record</button>
-                </form>
+                <div class="action-row secondary">
+                    <form method="post" action="/dashboard/payment/{debt_id}">
+                        <input name="amount" type="number" min="1" placeholder="Amount paid" class="small-input" required>
+                        <button class="btn green">Record Payment</button>
+                    </form>
 
-                <form method="post" action="/dashboard/schedule/{debt_id}">
-                    <input name="next_reminder_at" type="datetime-local" class="date-input" required>
-                    <button class="btn blue">Schedule</button>
-                </form>
+                    <form method="post" action="/dashboard/schedule/{debt_id}">
+                        <input name="next_reminder_at" type="datetime-local" class="date-input" required>
+                        <button class="btn blue">Schedule</button>
+                    </form>
 
-                <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
+                    <form method="post" action="/dashboard/paid/{debt_id}">
+                        <button class="btn gray">Mark Paid</button>
+                    </form>
 
-                <form method="post" action="/dashboard/delete/{debt_id}" onsubmit="return confirm('Are you sure you want to delete this customer?');">
-                    <button class="btn red">Delete</button>
-                </form>
+                    <form method="post" action="/dashboard/delete/{debt_id}" onsubmit="return confirm('Are you sure you want to delete this customer?');">
+                        <button class="btn red">Delete</button>
+                    </form>
+                </div>
             </td>
         </tr>
         """
@@ -248,7 +258,7 @@ def dashboard(
             }}
 
             .small-input {{
-                width: 75px;
+                width: 120px;
                 padding: 9px;
             }}
 
@@ -269,7 +279,7 @@ def dashboard(
                 padding: 16px;
                 border-bottom: 1px solid #334155;
                 text-align: left;
-                vertical-align: middle;
+                vertical-align: top;
             }}
 
             th {{
@@ -293,15 +303,20 @@ def dashboard(
             .gray {{ background: #64748b; }}
             .red {{ background: #dc2626; }}
 
-            .link-btn {{
-                display: inline-block;
+            .actions {{
+                min-width: 560px;
             }}
 
-            .actions {{
+            .action-row {{
                 display: flex;
                 gap: 8px;
                 flex-wrap: wrap;
                 align-items: center;
+                margin-bottom: 8px;
+            }}
+
+            .action-row.secondary {{
+                opacity: 0.95;
             }}
 
             form {{
@@ -329,10 +344,14 @@ def dashboard(
                 color: #93c5fd;
             }}
 
-            .hint {{
+            .hint, .muted {{
                 color: #94a3b8;
                 font-size: 14px;
                 margin-top: 4px;
+            }}
+
+            .small {{
+                font-size: 12px;
             }}
 
             .badge {{
@@ -340,6 +359,8 @@ def dashboard(
                 border-radius: 999px;
                 font-size: 13px;
                 font-weight: bold;
+                display: inline-block;
+                margin-bottom: 6px;
             }}
 
             .paid {{
@@ -355,6 +376,41 @@ def dashboard(
             .warning {{
                 background: #7f1d1d;
                 color: #fecaca;
+            }}
+
+            @media (max-width: 1100px) {{
+                body {{
+                    padding: 20px;
+                }}
+
+                .cards {{
+                    grid-template-columns: 1fr;
+                }}
+
+                table, thead, tbody, th, td, tr {{
+                    display: block;
+                }}
+
+                thead {{
+                    display: none;
+                }}
+
+                tr {{
+                    background: #1e293b;
+                    margin-bottom: 16px;
+                    border-radius: 16px;
+                    border: 1px solid #334155;
+                    padding: 12px;
+                }}
+
+                td {{
+                    border-bottom: none;
+                    padding: 10px;
+                }}
+
+                .actions {{
+                    min-width: unset;
+                }}
             }}
         </style>
     </head>
@@ -410,12 +466,10 @@ def dashboard(
             <thead>
                 <tr>
                     <th>Customer</th>
-                    <th>Phone</th>
                     <th>Total Debt</th>
                     <th>Paid</th>
                     <th>Remaining</th>
                     <th>Status</th>
-                    <th>Next Reminder</th>
                     <th>Actions</th>
                 </tr>
             </thead>
