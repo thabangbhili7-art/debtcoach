@@ -18,7 +18,10 @@ def hash_password(password: str):
 
 
 def verify_password(password: str, password_hash: str):
-    return pwd_context.verify(password, password_hash)
+    try:
+        return pwd_context.verify(password, password_hash)
+    except Exception:
+        return False
 
 
 def get_current_user(request: Request, db: Session):
