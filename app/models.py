@@ -37,7 +37,9 @@ class Payment(Base):
 
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    debt_id = Column(Integer, ForeignKey("debts.id"), nullable=True)
     amount_cents = Column(BigInteger, nullable=False)
+    note = Column(String(255), nullable=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
 class Reminder(Base):
