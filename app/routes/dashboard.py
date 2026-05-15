@@ -1,5 +1,6 @@
 import csv
 import io
+from datetime import datetime
 from html import escape
 
 from fastapi import APIRouter, Depends, Form, Request, UploadFile, File
@@ -20,7 +21,13 @@ router = APIRouter()
 
 
 def money(cents: int):
-    return f"R{cents // 100}"
+    return f"R{(cents or 0) // 100}"
+
+
+def format_dt(value):
+    if not value:
+        return "Not scheduled"
+    return str(value).split(".")[0]
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
@@ -51,20 +58,32 @@ def dashboard(
     for d in debts:
         key = ((d.creditor_name or "").strip().lower(), d.phone_number or "")
 
+        original = d.original_amount_cents or d.balance_cents or 0
+
         if key not in grouped:
             grouped[key] = {
                 "ids": [d.id],
                 "name": d.creditor_name,
                 "phone": d.phone_number,
-                "balance_cents": d.balance_cents,
+                "balance_cents": d.balance_cents or 0,
+                "original_amount_cents": original,
+                "next_reminder_at": d.next_reminder_at,
+                "due_date": d.due_date,
             }
         else:
             grouped[key]["ids"].append(d.id)
-            grouped[key]["balance_cents"] += d.balance_cents
+            grouped[key]["balance_cents"] += d.balance_cents or 0
+            grouped[key]["original_amount_cents"] += original
+
+            if d.next_reminder_at:
+                grouped[key]["next_reminder_at"] = d.next_reminder_at
 
     customers = list(grouped.values())
 
-    total_cents = sum(c["balance_cents"] for c in customers)
+    total_original_cents = sum(c["original_amount_cents"] for c in customers)
+    total_remaining_cents = sum(c["balance_cents"] for c in customers)
+    total_paid_cents = max(0, total_original_cents - total_remaining_cents)
+
     total_customers = len(customers)
     reachable = len([c for c in customers if c["phone"]])
 
@@ -78,6 +97,8 @@ def dashboard(
         message = "<div class='alert error'>Message failed. Check phone number, template approval, or Twilio logs.</div>"
     elif error == "csv_failed":
         message = "<div class='alert error'>CSV upload failed. Use columns: name, phone, amount.</div>"
+    elif error == "invalid_date":
+        message = "<div class='alert error'>Invalid reminder date.</div>"
     elif success == "added":
         message = "<div class='alert success'>Customer added.</div>"
     elif success == "deleted":
@@ -86,6 +107,8 @@ def dashboard(
         message = "<div class='alert success'>Customer marked as paid.</div>"
     elif success == "payment_recorded":
         message = "<div class='alert success'>Payment recorded.</div>"
+    elif success == "scheduled":
+        message = "<div class='alert success'>Reminder scheduled.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
     elif success == "uploaded":
@@ -94,7 +117,9 @@ def dashboard(
     rows = ""
 
     for c in customers:
-        amount = c["balance_cents"] // 100
+        remaining = c["balance_cents"] // 100
+        original = c["original_amount_cents"] // 100
+        paid = max(0, original - remaining)
         phone = c["phone"] or "No phone"
         debt_id = c["ids"][0]
 
@@ -112,8 +137,11 @@ def dashboard(
         <tr>
             <td>{escape(c["name"] or "")}</td>
             <td>{escape(phone)}</td>
-            <td>R{amount}</td>
+            <td>R{original}</td>
+            <td>R{paid}</td>
+            <td>R{remaining}</td>
             <td><span class="badge {status_class}">{status}</span></td>
+            <td>{escape(format_dt(c["next_reminder_at"]))}</td>
             <td class="actions">
                 <form method="post" action="/dashboard/remind/{debt_id}">
                     <button class="btn blue">Remind</button>
@@ -130,6 +158,11 @@ def dashboard(
                 <form method="post" action="/dashboard/payment/{debt_id}">
                     <input name="amount" type="number" min="1" placeholder="Paid" class="small-input" required>
                     <button class="btn green">Record</button>
+                </form>
+
+                <form method="post" action="/dashboard/schedule/{debt_id}">
+                    <input name="next_reminder_at" type="datetime-local" class="date-input" required>
+                    <button class="btn blue">Schedule</button>
                 </form>
 
                 <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
@@ -176,7 +209,7 @@ def dashboard(
 
             .cards {{
                 display: grid;
-                grid-template-columns: repeat(3, 1fr);
+                grid-template-columns: repeat(5, 1fr);
                 gap: 20px;
                 margin-bottom: 30px;
             }}
@@ -189,7 +222,7 @@ def dashboard(
             }}
 
             .card h2 {{
-                font-size: 32px;
+                font-size: 28px;
                 margin: 0;
             }}
 
@@ -216,6 +249,11 @@ def dashboard(
 
             .small-input {{
                 width: 75px;
+                padding: 9px;
+            }}
+
+            .date-input {{
+                width: 175px;
                 padding: 9px;
             }}
 
@@ -333,9 +371,11 @@ def dashboard(
         {message}
 
         <div class="cards">
-            <div class="card"><h2>{money(total_cents)}</h2><p>Total owed</p></div>
+            <div class="card"><h2>{money(total_original_cents)}</h2><p>Total debt</p></div>
+            <div class="card"><h2>{money(total_paid_cents)}</h2><p>Total paid</p></div>
+            <div class="card"><h2>{money(total_remaining_cents)}</h2><p>Remaining</p></div>
             <div class="card"><h2>{total_customers}</h2><p>Customers</p></div>
-            <div class="card"><h2>{reachable}</h2><p>Reachable by WhatsApp</p></div>
+            <div class="card"><h2>{reachable}</h2><p>Reachable</p></div>
         </div>
 
         <div class="panel">
@@ -371,8 +411,11 @@ def dashboard(
                 <tr>
                     <th>Customer</th>
                     <th>Phone</th>
-                    <th>Amount</th>
+                    <th>Total Debt</th>
+                    <th>Paid</th>
+                    <th>Remaining</th>
                     <th>Status</th>
+                    <th>Next Reminder</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -406,11 +449,14 @@ def add_customer(
     if phone and not clean_phone:
         return RedirectResponse("/dashboard?error=invalid_phone", status_code=303)
 
+    amount_cents = amount * 100
+
     debt = Debt(
         user_id=current_user.id,
         creditor_name=name.strip(),
         phone_number=clean_phone,
-        balance_cents=amount * 100,
+        balance_cents=amount_cents,
+        original_amount_cents=amount_cents,
     )
 
     db.add(debt)
@@ -463,11 +509,14 @@ async def upload_csv(
             if phone and not clean_phone:
                 continue
 
+            amount_cents = amount * 100
+
             debt = Debt(
                 user_id=current_user.id,
                 creditor_name=name,
                 phone_number=clean_phone,
-                balance_cents=amount * 100,
+                balance_cents=amount_cents,
+                original_amount_cents=amount_cents,
             )
 
             db.add(debt)
@@ -523,6 +572,35 @@ def record_payment(
     return RedirectResponse("/dashboard?success=payment_recorded", status_code=303)
 
 
+@router.post("/dashboard/schedule/{debt_id}")
+def schedule_reminder(
+    request: Request,
+    debt_id: int,
+    next_reminder_at: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
+
+    if not debt:
+        return RedirectResponse("/dashboard", status_code=303)
+
+    try:
+        debt.next_reminder_at = datetime.fromisoformat(next_reminder_at)
+        db.add(debt)
+        db.commit()
+        return RedirectResponse("/dashboard?success=scheduled", status_code=303)
+    except Exception:
+        return RedirectResponse("/dashboard?error=invalid_date", status_code=303)
+
+
 @router.get("/dashboard/customer/{debt_id}", response_class=HTMLResponse)
 def customer_timeline(
     request: Request,
@@ -546,6 +624,10 @@ def customer_timeline(
         Payment.debt_id == debt.id,
         Payment.user_id == current_user.id,
     ).order_by(Payment.created_at.desc()).all()
+
+    total_debt = debt.original_amount_cents or debt.balance_cents or 0
+    total_paid = sum(p.amount_cents for p in payments)
+    remaining = debt.balance_cents or 0
 
     payment_rows = ""
 
@@ -579,6 +661,13 @@ def customer_timeline(
                 margin-bottom: 24px;
             }}
 
+            .cards {{
+                display: grid;
+                grid-template-columns: repeat(3, 1fr);
+                gap: 20px;
+                margin-bottom: 24px;
+            }}
+
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -608,7 +697,13 @@ def customer_timeline(
         <div class="card">
             <h1>{escape(debt.creditor_name)}</h1>
             <p>Phone: {escape(debt.phone_number or "No phone")}</p>
-            <p>Outstanding balance: R{debt.balance_cents // 100}</p>
+            <p>Next reminder: {escape(format_dt(debt.next_reminder_at))}</p>
+        </div>
+
+        <div class="cards">
+            <div class="card"><h2>{money(total_debt)}</h2><p>Total debt</p></div>
+            <div class="card"><h2>{money(total_paid)}</h2><p>Total paid</p></div>
+            <div class="card"><h2>{money(remaining)}</h2><p>Remaining</p></div>
         </div>
 
         <h2>Payment Timeline</h2>

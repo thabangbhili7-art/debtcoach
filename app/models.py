@@ -31,6 +31,9 @@ class Debt(Base):
     user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
     creditor_name = Column(String(128), nullable=False)
     balance_cents = Column(BigInteger, nullable=False)  # store cents to avoid float issues
+    original_amount_cents = Column(BigInteger, nullable=True)
+    due_date = Column(DateTime(timezone=True), nullable=True)
+    next_reminder_at = Column(DateTime(timezone=True), nullable=True)
 
 class Payment(Base):
     __tablename__ = "payments"
