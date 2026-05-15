@@ -67,7 +67,6 @@ def dashboard(
                 "balance_cents": d.balance_cents or 0,
                 "original_amount_cents": original,
                 "next_reminder_at": d.next_reminder_at,
-                "due_date": d.due_date,
             }
         else:
             grouped[key]["ids"].append(d.id)
@@ -116,21 +115,29 @@ def dashboard(
     rows = ""
 
     for c in customers:
-        remaining = c["balance_cents"] // 100
-        original = c["original_amount_cents"] // 100
-        paid = max(0, original - remaining)
-        phone = c["phone"] or "No phone"
         debt_id = c["ids"][0]
+        phone = c["phone"] or "No phone"
+        original = c["original_amount_cents"]
+        remaining = c["balance_cents"]
+        paid = max(0, original - remaining)
 
         status = "Pending"
         status_class = "pending"
 
-        if c["balance_cents"] <= 0:
+        if remaining <= 0:
             status = "Paid"
             status_class = "paid"
         elif not c["phone"]:
             status = "No phone"
             status_class = "warning"
+
+        disabled_phone_actions = ""
+        if not c["phone"]:
+            disabled_phone_actions = "disabled"
+
+        disabled_paid_actions = ""
+        if remaining <= 0:
+            disabled_paid_actions = "disabled"
 
         rows += f"""
         <tr>
@@ -139,47 +146,62 @@ def dashboard(
                 <div class="muted">{escape(phone)}</div>
             </td>
 
-            <td>{money(c["original_amount_cents"])}</td>
-            <td>{money(max(0, c["original_amount_cents"] - c["balance_cents"]))}</td>
-            <td><strong>{money(c["balance_cents"])}</strong></td>
+            <td>{money(original)}</td>
+            <td>{money(paid)}</td>
+            <td><strong>{money(remaining)}</strong></td>
 
             <td>
                 <span class="badge {status_class}">{status}</span>
-                <div class="muted small">Next: {escape(format_dt(c["next_reminder_at"]))}</div>
+                <div class="muted small">Next reminder: {escape(format_dt(c["next_reminder_at"]))}</div>
             </td>
 
-            <td class="actions">
-                <div class="action-row">
-                    <form method="post" action="/dashboard/remind/{debt_id}">
-                        <button class="btn blue">Remind</button>
-                    </form>
+            <td>
+                <details>
+                    <summary class="manage-btn">Manage</summary>
 
-                    <form method="post" action="/dashboard/pay/{debt_id}">
-                        <button class="btn green">Pay Link</button>
-                    </form>
+                    <div class="manage-panel">
+                        <div class="manage-section">
+                            <strong>Messaging</strong>
+                            <div class="action-row">
+                                <form method="post" action="/dashboard/remind/{debt_id}">
+                                    <button class="btn blue" {disabled_phone_actions} {disabled_paid_actions}>Remind</button>
+                                </form>
 
-                    <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
-                </div>
+                                <form method="post" action="/dashboard/pay/{debt_id}">
+                                    <button class="btn green" {disabled_phone_actions} {disabled_paid_actions}>Pay Link</button>
+                                </form>
 
-                <div class="action-row secondary">
-                    <form method="post" action="/dashboard/payment/{debt_id}">
-                        <input name="amount" type="number" min="1" placeholder="Amount paid" class="small-input" required>
-                        <button class="btn green">Record Payment</button>
-                    </form>
+                                <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
+                            </div>
+                        </div>
 
-                    <form method="post" action="/dashboard/schedule/{debt_id}">
-                        <input name="next_reminder_at" type="datetime-local" class="date-input" required>
-                        <button class="btn blue">Schedule</button>
-                    </form>
+                        <div class="manage-section">
+                            <strong>Record payment</strong>
+                            <form method="post" action="/dashboard/payment/{debt_id}" class="inline-form">
+                                <input name="amount" type="number" min="1" placeholder="Amount paid" required {disabled_paid_actions}>
+                                <button class="btn green" {disabled_paid_actions}>Record</button>
+                            </form>
+                        </div>
 
-                    <form method="post" action="/dashboard/paid/{debt_id}">
-                        <button class="btn gray">Mark Paid</button>
-                    </form>
+                        <div class="manage-section">
+                            <strong>Schedule reminder</strong>
+                            <form method="post" action="/dashboard/schedule/{debt_id}" class="inline-form">
+                                <input name="next_reminder_at" type="datetime-local" required {disabled_paid_actions}>
+                                <button class="btn blue" {disabled_paid_actions}>Schedule</button>
+                            </form>
+                        </div>
 
-                    <form method="post" action="/dashboard/delete/{debt_id}" onsubmit="return confirm('Are you sure you want to delete this customer?');">
-                        <button class="btn red">Delete</button>
-                    </form>
-                </div>
+                        <div class="manage-section danger-zone">
+                            <form method="post" action="/dashboard/paid/{debt_id}">
+                                <button class="btn gray" {disabled_paid_actions}>Mark Paid</button>
+                            </form>
+
+                            <form method="post" action="/dashboard/delete/{debt_id}" onsubmit="return confirm('Are you sure you want to delete this customer?');">
+                                <button class="btn red">Delete</button>
+                            </form>
+                        </div>
+                    </div>
+                </details>
             </td>
         </tr>
         """
@@ -257,16 +279,6 @@ def dashboard(
                 margin-right: 8px;
             }}
 
-            .small-input {{
-                width: 120px;
-                padding: 9px;
-            }}
-
-            .date-input {{
-                width: 175px;
-                padding: 9px;
-            }}
-
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -276,7 +288,7 @@ def dashboard(
             }}
 
             th, td {{
-                padding: 16px;
+                padding: 18px 16px;
                 border-bottom: 1px solid #334155;
                 text-align: left;
                 vertical-align: top;
@@ -298,13 +310,49 @@ def dashboard(
                 font-size: 14px;
             }}
 
+            .btn:disabled {{
+                opacity: 0.45;
+                cursor: not-allowed;
+            }}
+
             .blue {{ background: #2563eb; }}
             .green {{ background: #16a34a; }}
             .gray {{ background: #64748b; }}
             .red {{ background: #dc2626; }}
 
-            .actions {{
-                min-width: 560px;
+            .manage-btn {{
+                background: #2563eb;
+                color: white;
+                padding: 9px 14px;
+                border-radius: 8px;
+                cursor: pointer;
+                display: inline-block;
+                font-weight: bold;
+                list-style: none;
+            }}
+
+            summary::-webkit-details-marker {{
+                display: none;
+            }}
+
+            .manage-panel {{
+                margin-top: 12px;
+                background: #0f172a;
+                border: 1px solid #334155;
+                border-radius: 14px;
+                padding: 14px;
+                min-width: 460px;
+            }}
+
+            .manage-section {{
+                margin-bottom: 14px;
+            }}
+
+            .manage-section strong {{
+                display: block;
+                margin-bottom: 8px;
+                color: #cbd5e1;
+                font-size: 14px;
             }}
 
             .action-row {{
@@ -312,11 +360,24 @@ def dashboard(
                 gap: 8px;
                 flex-wrap: wrap;
                 align-items: center;
-                margin-bottom: 8px;
             }}
 
-            .action-row.secondary {{
-                opacity: 0.95;
+            .inline-form {{
+                display: flex;
+                gap: 8px;
+                flex-wrap: wrap;
+            }}
+
+            .inline-form input {{
+                width: 170px;
+            }}
+
+            .danger-zone {{
+                display: flex;
+                gap: 8px;
+                border-top: 1px solid #334155;
+                padding-top: 14px;
+                margin-bottom: 0;
             }}
 
             form {{
@@ -408,7 +469,7 @@ def dashboard(
                     padding: 10px;
                 }}
 
-                .actions {{
+                .manage-panel {{
                     min-width: unset;
                 }}
             }}
@@ -470,7 +531,7 @@ def dashboard(
                     <th>Paid</th>
                     <th>Remaining</th>
                     <th>Status</th>
-                    <th>Actions</th>
+                    <th>Manage</th>
                 </tr>
             </thead>
             <tbody>{rows}</tbody>
@@ -689,7 +750,7 @@ def customer_timeline(
         payment_rows += f"""
         <tr>
             <td>Payment</td>
-            <td>R{p.amount_cents // 100}</td>
+            <td>{money(p.amount_cents)}</td>
             <td>{escape(p.note or "")}</td>
             <td>{p.created_at}</td>
         </tr>
