@@ -107,6 +107,8 @@ def dashboard(
         message = "<div class='alert success'>Payment recorded.</div>"
     elif success == "scheduled":
         message = "<div class='alert success'>Reminder scheduled.</div>"
+    elif success == "scheduled_all":
+        message = f"<div class='alert success'>Scheduled reminders for {escape(count or '0')} customer(s).</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
     elif success == "uploaded":
@@ -160,6 +162,8 @@ def dashboard(
                     <summary class="manage-btn">Manage</summary>
 
                     <div class="manage-panel">
+                        <button type="button" class="close-btn" onclick="this.closest('details').removeAttribute('open')">× Close</button>
+
                         <div class="manage-section">
                             <strong>Messaging</strong>
                             <div class="action-row">
@@ -344,6 +348,21 @@ def dashboard(
                 min-width: 460px;
             }}
 
+            .close-btn {{
+                background: transparent;
+                color: #94a3b8;
+                border: 1px solid #334155;
+                border-radius: 8px;
+                padding: 7px 10px;
+                cursor: pointer;
+                margin-bottom: 14px;
+            }}
+
+            .close-btn:hover {{
+                color: white;
+                border-color: #64748b;
+            }}
+
             .manage-section {{
                 margin-bottom: 14px;
             }}
@@ -512,6 +531,16 @@ def dashboard(
             <form method="post" action="/dashboard/upload" enctype="multipart/form-data">
                 <input name="file" type="file" accept=".csv" required>
                 <button class="btn green">Upload CSV</button>
+            </form>
+        </div>
+
+        <div class="panel">
+            <h2>Schedule All Owing Customers</h2>
+            <div class="hint">Only customers with a phone number and remaining balance will be scheduled.</div>
+            <br>
+            <form method="post" action="/dashboard/schedule-all">
+                <input name="next_reminder_at" type="datetime-local" required>
+                <button class="btn blue">Schedule All</button>
             </form>
         </div>
 
@@ -714,6 +743,40 @@ def schedule_reminder(
         return RedirectResponse("/dashboard?success=scheduled", status_code=303)
     except Exception:
         return RedirectResponse("/dashboard?error=invalid_date", status_code=303)
+
+
+@router.post("/dashboard/schedule-all")
+def schedule_all_reminders(
+    request: Request,
+    next_reminder_at: str = Form(...),
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    try:
+        reminder_time = datetime.fromisoformat(next_reminder_at)
+    except Exception:
+        return RedirectResponse("/dashboard?error=invalid_date", status_code=303)
+
+    debts = db.query(Debt).filter(
+        Debt.user_id == current_user.id,
+        Debt.balance_cents > 0,
+        Debt.phone_number.isnot(None),
+    ).all()
+
+    for debt in debts:
+        debt.next_reminder_at = reminder_time
+        db.add(debt)
+
+    db.commit()
+
+    return RedirectResponse(
+        f"/dashboard?success=scheduled_all&count={len(debts)}",
+        status_code=303,
+    )
 
 
 @router.get("/dashboard/customer/{debt_id}", response_class=HTMLResponse)
