@@ -7,7 +7,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from sqlalchemy.orm import Session
 
 from ..db import get_db
-from ..models import Debt
+from ..models import Debt, Payment
 from .auth import get_current_user
 from .whatsapp import (
     normalize_phone,
@@ -84,6 +84,8 @@ def dashboard(
         message = "<div class='alert success'>Customer deleted.</div>"
     elif success == "paid":
         message = "<div class='alert success'>Customer marked as paid.</div>"
+    elif success == "payment_recorded":
+        message = "<div class='alert success'>Payment recorded.</div>"
     elif success == "sent":
         message = "<div class='alert success'>Message sent.</div>"
     elif success == "uploaded":
@@ -96,11 +98,22 @@ def dashboard(
         phone = c["phone"] or "No phone"
         debt_id = c["ids"][0]
 
+        status = "Pending"
+        status_class = "pending"
+
+        if c["balance_cents"] <= 0:
+            status = "Paid"
+            status_class = "paid"
+        elif not c["phone"]:
+            status = "No phone"
+            status_class = "warning"
+
         rows += f"""
         <tr>
             <td>{escape(c["name"] or "")}</td>
             <td>{escape(phone)}</td>
             <td>R{amount}</td>
+            <td><span class="badge {status_class}">{status}</span></td>
             <td class="actions">
                 <form method="post" action="/dashboard/remind/{debt_id}">
                     <button class="btn blue">Remind</button>
@@ -113,6 +126,13 @@ def dashboard(
                 <form method="post" action="/dashboard/paid/{debt_id}">
                     <button class="btn gray">Paid</button>
                 </form>
+
+                <form method="post" action="/dashboard/payment/{debt_id}">
+                    <input name="amount" type="number" min="1" placeholder="Paid" class="small-input" required>
+                    <button class="btn green">Record</button>
+                </form>
+
+                <a class="btn blue link-btn" href="/dashboard/customer/{debt_id}">Timeline</a>
 
                 <form method="post" action="/dashboard/delete/{debt_id}" onsubmit="return confirm('Are you sure you want to delete this customer?');">
                     <button class="btn red">Delete</button>
@@ -194,6 +214,11 @@ def dashboard(
                 margin-right: 8px;
             }}
 
+            .small-input {{
+                width: 75px;
+                padding: 9px;
+            }}
+
             table {{
                 width: 100%;
                 border-collapse: collapse;
@@ -206,6 +231,7 @@ def dashboard(
                 padding: 16px;
                 border-bottom: 1px solid #334155;
                 text-align: left;
+                vertical-align: middle;
             }}
 
             th {{
@@ -220,6 +246,8 @@ def dashboard(
                 border-radius: 8px;
                 cursor: pointer;
                 font-weight: bold;
+                text-decoration: none;
+                font-size: 14px;
             }}
 
             .blue {{ background: #2563eb; }}
@@ -227,10 +255,15 @@ def dashboard(
             .gray {{ background: #64748b; }}
             .red {{ background: #dc2626; }}
 
+            .link-btn {{
+                display: inline-block;
+            }}
+
             .actions {{
                 display: flex;
                 gap: 8px;
                 flex-wrap: wrap;
+                align-items: center;
             }}
 
             form {{
@@ -262,6 +295,28 @@ def dashboard(
                 color: #94a3b8;
                 font-size: 14px;
                 margin-top: 4px;
+            }}
+
+            .badge {{
+                padding: 6px 10px;
+                border-radius: 999px;
+                font-size: 13px;
+                font-weight: bold;
+            }}
+
+            .paid {{
+                background: #14532d;
+                color: #bbf7d0;
+            }}
+
+            .pending {{
+                background: #78350f;
+                color: #fde68a;
+            }}
+
+            .warning {{
+                background: #7f1d1d;
+                color: #fecaca;
             }}
         </style>
     </head>
@@ -317,6 +372,7 @@ def dashboard(
                     <th>Customer</th>
                     <th>Phone</th>
                     <th>Amount</th>
+                    <th>Status</th>
                     <th>Actions</th>
                 </tr>
             </thead>
@@ -379,7 +435,6 @@ async def upload_csv(
         decoded = contents.decode("utf-8-sig")
 
         reader = csv.DictReader(io.StringIO(decoded))
-
         required_columns = {"name", "phone", "amount"}
 
         if not reader.fieldnames or not required_columns.issubset(set(reader.fieldnames)):
@@ -428,6 +483,154 @@ async def upload_csv(
     except Exception as e:
         print("CSV UPLOAD ERROR:", str(e))
         return RedirectResponse("/dashboard?error=csv_failed", status_code=303)
+
+
+@router.post("/dashboard/payment/{debt_id}")
+def record_payment(
+    request: Request,
+    debt_id: int,
+    amount: int = Form(...),
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
+
+    if not debt or amount <= 0:
+        return RedirectResponse("/dashboard?error=invalid_amount", status_code=303)
+
+    payment_cents = amount * 100
+
+    payment = Payment(
+        user_id=current_user.id,
+        debt_id=debt.id,
+        amount_cents=payment_cents,
+        note="Partial payment recorded",
+    )
+
+    debt.balance_cents = max(0, debt.balance_cents - payment_cents)
+
+    db.add(payment)
+    db.add(debt)
+    db.commit()
+
+    return RedirectResponse("/dashboard?success=payment_recorded", status_code=303)
+
+
+@router.get("/dashboard/customer/{debt_id}", response_class=HTMLResponse)
+def customer_timeline(
+    request: Request,
+    debt_id: int,
+    db: Session = Depends(get_db),
+):
+    current_user = get_current_user(request, db)
+
+    if not current_user:
+        return RedirectResponse("/login", status_code=303)
+
+    debt = db.query(Debt).filter(
+        Debt.id == debt_id,
+        Debt.user_id == current_user.id,
+    ).first()
+
+    if not debt:
+        return RedirectResponse("/dashboard", status_code=303)
+
+    payments = db.query(Payment).filter(
+        Payment.debt_id == debt.id,
+        Payment.user_id == current_user.id,
+    ).order_by(Payment.created_at.desc()).all()
+
+    payment_rows = ""
+
+    for p in payments:
+        payment_rows += f"""
+        <tr>
+            <td>Payment</td>
+            <td>R{p.amount_cents // 100}</td>
+            <td>{escape(p.note or "")}</td>
+            <td>{p.created_at}</td>
+        </tr>
+        """
+
+    html = f"""
+    <html>
+    <head>
+        <title>Customer Timeline</title>
+        <style>
+            body {{
+                font-family: Arial, sans-serif;
+                background: #0f172a;
+                color: white;
+                padding: 40px;
+            }}
+
+            .card {{
+                background: #1e293b;
+                padding: 24px;
+                border-radius: 16px;
+                border: 1px solid #334155;
+                margin-bottom: 24px;
+            }}
+
+            table {{
+                width: 100%;
+                border-collapse: collapse;
+                background: #1e293b;
+                border-radius: 16px;
+                overflow: hidden;
+            }}
+
+            th, td {{
+                padding: 16px;
+                border-bottom: 1px solid #334155;
+                text-align: left;
+            }}
+
+            th {{
+                background: #111827;
+            }}
+
+            a {{
+                color: #93c5fd;
+            }}
+        </style>
+    </head>
+    <body>
+        <a href="/dashboard">← Back to dashboard</a>
+
+        <div class="card">
+            <h1>{escape(debt.creditor_name)}</h1>
+            <p>Phone: {escape(debt.phone_number or "No phone")}</p>
+            <p>Outstanding balance: R{debt.balance_cents // 100}</p>
+        </div>
+
+        <h2>Payment Timeline</h2>
+
+        <table>
+            <thead>
+                <tr>
+                    <th>Type</th>
+                    <th>Amount</th>
+                    <th>Note</th>
+                    <th>Date</th>
+                </tr>
+            </thead>
+            <tbody>
+                {payment_rows or "<tr><td colspan='4'>No payments recorded yet.</td></tr>"}
+            </tbody>
+        </table>
+    </body>
+    </html>
+    """
+
+    return html
 
 
 @router.post("/dashboard/remind/{debt_id}")
@@ -516,7 +719,16 @@ def dashboard_paid(
                 amount,
             )
 
+        payment = Payment(
+            user_id=current_user.id,
+            debt_id=debt.id,
+            amount_cents=debt.balance_cents,
+            note="Marked as paid",
+        )
+
         debt.balance_cents = 0
+
+        db.add(payment)
         db.add(debt)
         db.commit()
 
